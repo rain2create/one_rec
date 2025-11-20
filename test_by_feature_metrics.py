@@ -45,7 +45,7 @@ url_tokenizer = UrlTokenizer.from_args(data_args)
 # load_data
 pt_parser = PtParser(data_args.columns_def, tokenizer=url_tokenizer) 
 pt_dataset = PtDataset(".", pt_parser.parser, 0, batch_size = 1, 
-    test_root_dirs = "/mnt/video.rank.s101.pos_neg/20251104/2025110409/")
+    test_root_dirs = "/mnt/video.rank.s101.pos_neg_test/20251113/2025111316/")
 dataloader = DataLoader(pt_dataset, batch_size=None, num_workers=1, pin_memory=True)
 
 # 加载 TorchScript 模型
@@ -57,12 +57,11 @@ dataloader = DataLoader(pt_dataset, batch_size=None, num_workers=1, pin_memory=T
 device = "cuda:0"
 model = RecModel.from_args(model_args)
 
-#ckpt_path = os.path.join(train_args.output_dir, f"checkpoint-936217.pt")
-#ckpt_path = "/data04/search/tanxiaofeng/dev/onerec_new_id/data/pt_model/checkpoint-315068.pt"
-ckpt_path = "../data/pt_model/checkpoint-112847.pt"
+ckpt_path = "../data/pt_model/checkpoint-191510.pt"
 global_step = load_checkpoint(model, None, None, None, ckpt_path, logger, None)
 
 model = model.to(device)
+model.eval()
 
 
 def cal_hits(his_ids, r_ids):
@@ -83,9 +82,10 @@ for i, x in enumerate(dataloader):
     logque_ids = inputs['logque_md5'][0]
     logses_ids = inputs['logsess_md5'][0]
 
-    res = model.generate(inputs, group_num=100)
+    with torch.no_grad():
+        res = model.generate(inputs, group_num=100)
     # res = model.rl_generate(inputs, group_num=100, top_k=20, top_p=0.1, strategy='topp')
-    output_ids = res["output_ids"]
+    output_ids = res["output_ids"].detach().cpu()
     # log_probs = res["output_logprobs"].sum(dim=-1)
 
     urls = url_tokenizer.batch_decode(output_ids)

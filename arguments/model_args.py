@@ -14,7 +14,7 @@ from typing import Dict
 class ModelArguments:
     # encoder
     emb_dim: int = 64
-    model_dim: int = 512
+    model_dim: int = 256
     encoder_num_layers: int = 6
     encoder_num_heads: int = 4
     encoder_dropout: float = 0.1

@@ -13,7 +13,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Union
 from model.decoder_moe import DecoderMOE, DecoderLayerMOE
+from model.moe_auxloss import MANAGER
 from utils.logger import logger
+from utils.metrics import MeanMetric
 
 
 class Decoder(nn.Module):
@@ -47,7 +49,7 @@ class Decoder(nn.Module):
         self.weight_tying = weight_tying
         self.seqs_len = self.codebook_layers + 1
         self.ignore_idx = ignore_idx
-        
+
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.ignore_idx, reduction='none')
         # self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.ignore_idx)
 
@@ -71,7 +73,7 @@ class Decoder(nn.Module):
         """
 
         decoder_layer = DecoderLayerMOE(
-            num_experts=12,
+            num_experts=24,
             top_k=2,
             d_model=self.model_dim,
             nhead=self.num_heads,
@@ -79,7 +81,8 @@ class Decoder(nn.Module):
             dropout=self.dropout,
             activation='gelu',
             batch_first=True,
-            norm_first=self.pre_norm
+            norm_first=self.pre_norm,
+            enable_moe=True,
         )
         self.transformer_decoder = DecoderMOE(decoder_layer, num_layers=self.layer_num)
 
@@ -91,12 +94,19 @@ class Decoder(nn.Module):
             for i in range(self.codebook_layers):
                 self.output_layers[i].weight = self.embeddings[i+1].weight
 
+        if not torch.jit.is_scripting():
+            self.loss_rl = MeanMetric()
+            self.loss_ct = MeanMetric()
+            self.pos_pi_new = MeanMetric()
+            self.neg_pi_new = MeanMetric()
+            self.cts_pi_new = MeanMetric()
+
     def _generate_square_subsequent_mask(self, sz: int):
         """Generate a square subsequent mask (upper triangular -inf)."""
         mask = torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
         return mask
 
-    def _compute_output_logits(self, encoder_output: torch.Tensor, encoder_mask: torch.Tensor, input_ids: torch.Tensor, return_al=False) -> torch.Tensor:
+    def _compute_output_logits(self, encoder_output: torch.Tensor, encoder_mask: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """
         TorchScript 兼容版本，不使用 ModuleList 动态索引
         Args:
@@ -120,7 +130,7 @@ class Decoder(nn.Module):
             input_embs[:, i, :] = F.embedding(input_ids[:, i], emb_weights[i])
 
         # 3. transformer decoder forward
-        decoder_out, al_losses = self.transformer_decoder(
+        decoder_out = self.transformer_decoder(
             input_embs, encoder_output, tgt_mask=tgt_mask_, memory_key_padding_mask=encoder_mask
         )  # [B, slen, D]
 
@@ -139,8 +149,6 @@ class Decoder(nn.Module):
             output_list.append(torch.matmul(emb, weight))
             """
         output_logits = torch.stack(output_list, dim=1)  # [B, slen, V]
-        if return_al:
-            return output_logits, al_losses
         return output_logits
 
     @torch.jit.export
@@ -204,6 +212,32 @@ class Decoder(nn.Module):
         target_probs  = torch.gather(log_probs_all, 2, target_ids.unsqueeze(2)).squeeze(-1)      #[batch, 3]
         return target_probs
 
+    def rl_loss(self, features: Dict[str, torch.Tensor], pi_new: torch.Tensor):
+        pi_safe = torch.where(
+                features['advantages'] >= 0.0, 
+                torch.maximum(features['pi_old'], pi_new.detach()),
+                torch.maximum(features['pi_old'], 1.0 - pi_new.detach())
+        )
+        ratio = pi_new / pi_safe
+        # print(
+        #         'adv', features['advantages'][:3], 
+        #         'pin', pi_new[:3],
+        #         'pis', pi_safe[:3],
+        #         'rat', ratio[:3],
+        #         'adv', features['advantages'][-3:],
+        #         'pin', pi_new[-3:],
+        #         'pis', pi_safe[-3:],
+        #         'rat', ratio[-3:]
+        # )
+        loss = -(ratio * features['advantages']).mean()
+        pos_pi_new = torch.where(features['advantages'] > 0, pi_new, 0.0).sum() / (torch.sum(features['advantages'] > 0) + 1e-6)
+        neg_pi_new = torch.where(features['advantages'] < 0, pi_new, 0.0).sum() / (torch.sum(features['advantages'] < 0) + 1e-6)
+        cts_pi_new = torch.where(features['advantages'] == 0, pi_new, 0.0).sum() / (torch.sum(features['advantages'] == 0) + 1e-6)
+        self.pos_pi_new(pos_pi_new)
+        self.neg_pi_new(neg_pi_new)
+        self.cts_pi_new(cts_pi_new)
+        return loss
+
     def forward(self, features: Dict[str, torch.Tensor], encoder_output: torch.Tensor, encoder_mask: torch.Tensor):
         """
         features: Dict[str, torch.Tensor]
@@ -218,7 +252,7 @@ class Decoder(nn.Module):
         # shape: [batch_size, 4]
         url_ids = features["url"]
         seqs_len = url_ids.shape[1]
-        output_logits, aux_loss = self._compute_output_logits(encoder_output, encoder_mask, url_ids[:, 0 : -1], return_al=True)  #[batch, codebook_layers, V]
+        output_logits = self._compute_output_logits(encoder_output, encoder_mask, url_ids[:, 0 : -1])  #[batch, codebook_layers, V]
 
         labels = url_ids[:, 1:]
         batch_size, seq_len_minus1, vocab_size = output_logits.shape
@@ -231,29 +265,50 @@ class Decoder(nn.Module):
         mask_expanded = mask.unsqueeze(1).expand(-1, seqs_len-1).reshape(-1).to(torch.bool)
         masked_labels = labels.clone()
         masked_labels[~mask_expanded] = self.ignore_idx # 设置无效位置忽略
-        
+
         if (masked_labels != self.ignore_idx).any():
             loss = self.loss_fn(output_logits, masked_labels)
-            # handle neg loss
-            loss_neg = torch.log(1e-6 + 1.0 - torch.exp(loss * -1.0))
-            w = features['sample_weights'].repeat_interleave(3, dim=0)
-            loss = torch.where(w > 0.0, loss, loss_neg) * torch.sign(w)
-            # 跟进 th 做截断, harf negative
-            t = features['loss_th'].repeat_interleave(3, dim=0)
-            loss = torch.where(loss > t, loss, 0.0)
-            loss = (loss * torch.abs(w)).mean()
-            loss = loss + 0.02 * aux_loss
+
+            # v1 对比 + 权重融合
+            # # handle neg loss
+            # loss_neg = torch.log(1e-6 + 1.0 - torch.exp(loss * -1.0))
+            # w = features['sample_weights'].repeat_interleave(3, dim=0)
+            # loss = torch.where(w > 0.0, loss, loss_neg) * torch.sign(w)
+            # # 跟进 th 做截断, hard negative
+            # t = features['loss_th'].repeat_interleave(3, dim=0)
+            # loss = torch.where(loss > t, loss, 0.0)
+            # loss = (loss * torch.abs(w)).mean()
+
+            if not torch.jit.is_scripting():
+                # v2, 只有对比的部分
+                loss_neg = - torch.log(1e-6 + 1.0 - torch.exp(loss * -1.0))
+                s = features['sample_weights'].repeat_interleave(3, dim=0)
+                loss = (torch.where(s > 0.0, loss, loss_neg)).mean()
+                self.loss_ct(loss)
+
+            # 专家负载均衡loss
+            if not torch.jit.is_scripting():
+                aux_loss = 0.01 * MANAGER.aggregate_aux_loss()
+                MANAGER.reset_aux_loss()
+                loss = loss + aux_loss
         else:
             # 返回0损失，保持梯度流通
-            # loss = torch.tensor(0.0, device=output_logits.device, requires_grad=True)
-            # 不能直接返回requires_grad=True的0，而是需要和计算图发生联系，否则多卡做梯度同步时会出错
-            # loss = (output_logits.sum() * 0.0)
             loss = (output_logits * 0.0).mean()
+
         output_logits = output_logits.view(batch_size, seq_len_minus1, vocab_size)
         labels = labels.view(batch_size, seq_len_minus1)
         log_probs = F.log_softmax(output_logits, dim=-1)
         # [batch_size]
         probs = torch.exp(torch.gather(log_probs, dim=2, index=labels.unsqueeze(-1)).squeeze(-1).sum(dim=-1))
+
+        if not torch.jit.is_scripting():
+            # v2, 强化部分，通过advantage 影响目标
+            rl_loss = self.rl_loss(features, probs)
+            if not torch.jit.is_scripting():
+                if loss > 0.0:
+                    loss = loss + rl_loss
+                    self.loss_rl(rl_loss)
+
         # valid prob 
         mask_valid = mask.sum()
         final_valid = torch.where(masked_labels == self.ignore_idx, 0., 1.).sum() / (seqs_len-1)
@@ -279,7 +334,7 @@ class Decoder(nn.Module):
 
         # 初始化bos_token
         input_ids = torch.full((new_B, 1), self.bos_token_id, dtype=torch.long, device=device)
-    
+
         for step in range(self.codebook_layers):
             # 1. 计算对应位置的预测logits
             output_logits = self._compute_output_logits(encoder_output, encoder_mask, input_ids)     #[batch, curlen, V]
@@ -292,10 +347,10 @@ class Decoder(nn.Module):
     
             # 4. 将新采样得到的tokenid放入input_ids
             input_ids = torch.cat([input_ids, next_token.unsqueeze(1)], dim=1)  
-    
+
         # 组装结果
         output_ids = input_ids[:, 1:]
-    
+
         return {
             "output_ids": output_ids,
         }
@@ -322,7 +377,10 @@ class Decoder(nn.Module):
             # 1. 计算对应位置的预测logits
             output_logits = self._compute_output_logits(encoder_output, encoder_mask, input_ids)     #[batch, curlen, V]
             last_logits = output_logits[:, -1, :]       # [new_b, V]
-     
+
+            # 温度缩放，解决前两级别锁死的问题
+            last_logits = last_logits / last_logits.std()
+
             # 2. 扩展候选
             log_probs_step = F.log_softmax(last_logits, dim=-1)
             topk_log_probs, topk_tokens = torch.topk(log_probs_step, group_num, dim=-1)  # [new_B, group_num]
@@ -357,7 +415,7 @@ class Decoder(nn.Module):
             # 7. 更新 input_ids
             input_ids = torch.cat([input_ids, selected_tokens.unsqueeze(1)], dim=1)  # [B*group_num, seq_len+1]
             logprobs = torch.cat([logprobs, selected_log_probs.unsqueeze(1)], dim=1)  # [B*group_num, seq_len+1]
-     
+
         # 12. 输出
         output_ids = input_ids[:, 1:]  # 去掉 bos
         log_probs = logprobs[:, 1:]

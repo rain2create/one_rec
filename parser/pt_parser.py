@@ -194,14 +194,14 @@ class PtParser:
         """
         res = {}
         logtime_expanded = logtime.unsqueeze(1) if logtime.dim() == 1 else logtime
-        logsess_md5_list = self._split_and_pad_fast(features["f044.logsess_item_seqs"], sep='|', pad_val='url_pad', max_len=3)
-        logsess_qid_list = self._split_and_pad_fast(features["f072.logsess_seqsQid"], sep='|', pad_val='qid_pad', max_len=3)
-        logsess_videotag_list = self._split_and_pad_fast(features["f074.logsess_seqsVideotag"], sep='|', pad_val='tag_pad', max_len=3)
-        logsess_timestamp_list = self._split_and_pad_fast(features["f046.logsess_time_seqs"], sep='|', pad_val='0', max_len=3)
-        logsess_dur_list = self._split_and_pad_fast(features["f073.logsess_seqsDuration"], sep='|', pad_val='0', max_len=3)
-        logsess_dwell_list = self._split_and_pad_fast(features["f071.logsess_seqsDwell"], sep='|', pad_val='0', max_len=3)
+        logsess_md5_list = self._split_and_pad_fast(features["f044.logsess_item_seqs"], sep='|', pad_val='url_pad', max_len=30)
+        logsess_qid_list = self._split_and_pad_fast(features["f072.logsess_seqsQid"], sep='|', pad_val='qid_pad', max_len=30)
+        logsess_videotag_list = self._split_and_pad_fast(features["f074.logsess_seqsVideotag"], sep='|', pad_val='tag_pad', max_len=30)
+        logsess_timestamp_list = self._split_and_pad_fast(features["f046.logsess_time_seqs"], sep='|', pad_val='0', max_len=30)
+        logsess_dur_list = self._split_and_pad_fast(features["f073.logsess_seqsDuration"], sep='|', pad_val='0', max_len=30)
+        logsess_dwell_list = self._split_and_pad_fast(features["f071.logsess_seqsDwell"], sep='|', pad_val='0', max_len=30)
         logsess_dwell_list = self._preprocess_dwell(logsess_dwell_list, logsess_dur_list)  # 处理用户观看时长
-        logsess_label_list = self._split_and_pad_fast(features["f047.logsess_att_seqs"], sep='|', pad_val='0', max_len=3)
+        logsess_label_list = self._split_and_pad_fast(features["f047.logsess_att_seqs"], sep='|', pad_val='0', max_len=30)
 
         res["logsess_md5"] = self._hash_to_tensor(logsess_md5_list, vocab_size=20000019, seed=0, dtype=torch.int64)
         res["logsess_qid"] = self._hash_to_tensor(logsess_qid_list, vocab_size=1000003, seed=0, dtype=torch.int64)
@@ -373,21 +373,24 @@ class PtParser:
 
         # sample weights
         w = np.ones_like(res['mask'], dtype=np.float32)
-        w = np.where(features['f029.like'] == '1', 8.0, w)
-        w = np.where(features['f030.like_c'] == '1', -1.0, w)
-        w = np.where(features['f090.favorite_c'] == '1', -1.0, w)
-        w = np.where(features['f031.dislike'] == '1', -1.0, w)
-        w = np.where(features['skip'] == 1.0, -1.0, w)
+        w = np.where(features['f029.like'] == '1', w+8.0, w)
+        w = np.where(features['f030.like_c'] == '1', w-2.0, w)
+        w = np.where(features['f090.favorite_c'] == '1', w-2.0, w)
+        w = np.where(features['f031.dislike'] == '1', w-2.0, w)
+        w = np.where(features['skip'] == 1.0, w-1.2, w)
         duration_w = np.log(res['duration'].numpy() + 1.0) - 1.0
         duration_w = duration_w / np.mean(duration_w)
-        res['sample_weights'] = torch.from_numpy(w * duration_w)
+        res['advantages'] = torch.from_numpy(w * duration_w)
+
+        res['sample_weights'] = torch.sign(res['advantages'])
+        res['pi_old'] = torch.exp(torch.rand(res['advantages'].size()[0]) - 6.0)
 
         # loss th
         th = np.zeros_like(res['mask'], dtype=np.float32)
-        th = np.where(features['skip'], 5.0, th)
-        th = np.where(features['f030.like_c'], 5.0, th)
-        th = np.where(features['f031.dislike'], 5.0, th)
-        th = np.where(features['f090.favorite_c'], 5.0, th)
+        th = np.where(features['skip'], 6.0, th)
+        th = np.where(features['f030.like_c'], 6.0, th)
+        th = np.where(features['f031.dislike'], 6.0, th)
+        th = np.where(features['f090.favorite_c'], 6.0, th)
         res['loss_th'] = torch.from_numpy(th)
 
         return res
@@ -419,19 +422,23 @@ class PtParser:
         indexes   = idx_valid[perm[:L]]
         return indexes
 
-    def expand(self, features, alpha=-1.0):
-        url_indexes = self.sample_index(features, 1.0)
-        neg_indexes = self.sample_index(features, 1.0)
+    def expand_neg(self, features, alpha=-1.0):
+        sample_rate = 1.0
+        url_indexes = self.sample_index(features, sample_rate)
+        fea_indexes = self.sample_index(features, sample_rate)
 
         for k, v in features.items():
             if k == 'url':
                 v_shuffle = v[url_indexes]
                 features[k] = torch.concat([v, v_shuffle], 0)
-            elif k == 'sample_weights':
-                sampled_weights = v[url_indexes]
-                features[k] = torch.concat([v, torch.ones_like(sampled_weights) * torch.mean(sampled_weights) * alpha], 0)
+            elif k == 'sample_weights': # 这里只取的正样本做对比学习
+                sampled_weights = v[fea_indexes]
+                features[k] = torch.concat([v, torch.ones_like(sampled_weights) * alpha], 0)
+            elif k == 'advantages':
+                advantages = v[url_indexes]
+                features[k] = torch.concat([v, torch.zeros_like(advantages)], 0)
             else:
-                v_shuffle = v[neg_indexes]
+                v_shuffle = v[fea_indexes]
                 features[k] = torch.concat([v, v_shuffle], 0)
 
     def expand_pos(self, features, alpha = 0.1):
@@ -473,7 +480,7 @@ class PtParser:
         #self.expand_pos(features, 0.1)
 
         ## 负样本
-        self.expand(features, -1.0)
+        self.expand_neg(features, -1.0)
 
         return features
 

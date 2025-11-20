@@ -8,7 +8,8 @@
 #   desc     :
 # ========================================================
 import torch, torch.nn as nn
-from model.moe_auxloss import MoeFFN
+#from model.moe_auxloss import MoeFFN
+from model.moe_auxloss import MOELayer, MOEConfig
 from typing import Any, Callable, Optional, Union
 from torch import Tensor
 import torch.nn.functional as F
@@ -94,9 +95,8 @@ class DecoderMOE(TransformerDecoder):
         seq_len = _get_seq_len(tgt, self.layers[0].self_attn.batch_first)
         tgt_is_causal = _detect_is_causal_mask(tgt_mask, tgt_is_causal, seq_len)
 
-        al_losses = []
         for mod in self.layers:
-            output, al = mod(
+            output = mod(
                 output,
                 memory,
                 tgt_mask=tgt_mask,
@@ -106,12 +106,11 @@ class DecoderMOE(TransformerDecoder):
                 tgt_is_causal=tgt_is_causal,
                 memory_is_causal=memory_is_causal,
             )
-            al_losses.append(al)
 
         if self.norm is not None:
             output = self.norm(output)
 
-        return output, torch.stack(al_losses).mean()
+        return output
 
 
 class DecoderLayerMOE(TransformerDecoderLayer):
@@ -123,15 +122,29 @@ class DecoderLayerMOE(TransformerDecoderLayer):
         dim_feedforward=2048,
         num_experts=8,
         top_k=2,
+        enable_moe=True,
         **kw
     ) -> None:
-        super().__init__(d_model=d_model,nhead=nhead,**kw)
+        super().__init__(d_model=d_model,nhead=nhead,dim_feedforward=dim_feedforward,**kw)
+
+        self.moe_config = MOEConfig(
+            n_embd = d_model,
+            dropout = 0.1,
+            n_exp = num_experts,
+            top_k = top_k,
+            use_aux_loss = True,
+        )
+        self.enable_moe = enable_moe
+        if self.enable_moe:
+            self.moe = MOELayer(self.moe_config)
+        '''
         self.moe = MoeFFN(
                 d_model, 
                 num_experts=num_experts,
                 top_k=top_k,
                 dim_feedforward=dim_feedforward
             )
+        '''
 
     def forward(
         self,
@@ -146,7 +159,6 @@ class DecoderLayerMOE(TransformerDecoderLayer):
     ) -> Tensor:
 
         x = tgt
-        al = 0.0
         if self.norm_first:
             x = x + self._sa_block(
                 self.norm1(x), tgt_mask, tgt_key_padding_mask, tgt_is_causal
@@ -158,9 +170,11 @@ class DecoderLayerMOE(TransformerDecoderLayer):
                 memory_key_padding_mask,
                 memory_is_causal,
             )
-            # x = x + self._ff_block(self.norm3(x))
-            x_, al = self.moe(self.norm3(x))
-            x = x + x_
+            if self.enable_moe:
+                x_ = self.moe(self.norm3(x))
+                x = x + x_
+            else:
+                x = x + self._ff_block(self.norm3(x))
         else:
             x = self.norm1(
                 x + self._sa_block(x, tgt_mask, tgt_key_padding_mask, tgt_is_causal)
@@ -171,11 +185,13 @@ class DecoderLayerMOE(TransformerDecoderLayer):
                     x, memory, memory_mask, memory_key_padding_mask, memory_is_causal
                 )
             )
-            # x = self.norm3(x + self._ff_block(x))
-            x_, al = self.moe(x)
-            x = self.norm3(x + x_)
+            if self.enable_moe:
+                x_ = self.moe(x)
+                x = self.norm3(x + x_)
+            else:
+                x = self.norm3(x + self._ff_block(x))
 
-        return x, al
+        return x
 
 
 if __name__ == "__main__":

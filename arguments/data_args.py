@@ -25,8 +25,8 @@ class DataArguments:
     root_dir: str ="/mnt/video.rank.s101.pos_neg"
     corpus_days: int = 2
     with_today: bool = False
-    # batch_size: int = 1024
-    batch_size: int = 512
+    batch_size: int = 1024
+    # batch_size: int = 512
     shuffle_buffer_size: int = 10000
     compress_type: str = "gzip"
     done_spec: str = "onerec_sft_lazy_decoder_256_new_id"

@@ -41,9 +41,9 @@ class SparseModel(nn.Module):
 
     def _get_embedding(self, name: str, x: torch.Tensor) -> torch.Tensor:
         # 用 if-elif 静态分支，TorchScript 能编译
-        if name == "uid":
-            return self.feature_embeddings["uid"](x)
-        elif name == "sign":
+        #if name == "uid":
+        #    return self.feature_embeddings["uid"](x)
+        if name == "sign":
             return self.feature_embeddings["sign"](x)
         elif name == "autok":
             return self.feature_embeddings["autok"](x)

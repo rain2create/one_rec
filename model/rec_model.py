@@ -21,6 +21,8 @@ from arguments.model_args import ModelArguments
 # # 允许 cuDNN 在 FP32 卷积中使用 TF32
 # Torch.backends.cudnn.allow_tf32 = True
 
+torch.set_float32_matmul_precision('high')   # 或 'medium'，效果相同
+
 class RecModel(nn.Module):
     def __init__(self, emb_dim : int,
                         model_dim : int, 
@@ -71,7 +73,7 @@ class RecModel(nn.Module):
         att_emb, att_mask = self.encoder(features, feature_embeddings)
         output_logits, loss, mask_valid, final_valid, probs = self.decoder(features, att_emb, att_mask)
         return output_logits, loss, mask_valid, final_valid, probs
-    
+
     @torch.jit.export
     def rl_generate(self, features: Dict[str, torch.Tensor], group_num: int = 1, top_p: float = 0.9, top_k: int = 10, strategy: str = "topk"):
         feature_embeddings = self.sparse_model(features)

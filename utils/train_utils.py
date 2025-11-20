@@ -99,9 +99,9 @@ def log_model_parm_info(model, logger):
         model = model.module
     for name, param in model.named_parameters():
         if param.requires_grad:
-            logger.info(f"{name}: {param.shape} {param.numel()} (requires_grad)")
+            logger.info(f"{name}: {param.shape} {param.numel()} {param.device} (requires_grad)")
         else:
-            logger.info(f"{name}: {param.shape} {param.numel()} (not requires_grad)")
+            logger.info(f"{name}: {param.shape} {param.numel()} {param.device} (not requires_grad)")
 
 def reduce_sparse_parameters(model_sparse):
     # 对 sparse_model 的所有参数做 all_reduce 求和，并除以 world_size 实现平均。

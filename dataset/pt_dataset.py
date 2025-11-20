@@ -77,15 +77,20 @@ class PtDataset(IterableDataset):
         with_today: bool = True
     ) -> List[str]:
         # 获取待训练的语料文件
-        begin_day    = datetime.date.today() - datetime.timedelta(self.corpus_days)
-        begin_day    = begin_day.strftime("%Y%m%d")
-        today = datetime.date.today().strftime("%Y%m%d")
+        #begin_day    = datetime.date.today() - datetime.timedelta(self.corpus_days)
+        #begin_day    = begin_day.strftime("%Y%m%d")
+        #today = datetime.date.today().strftime("%Y%m%d")
+
         corpus_dirs = []  # 天级文件夹
-        corpus_dirs_  = os.listdir(self.root_dir)
-        corpus_dirs_  = sorted(filter(lambda x : x >= begin_day,  corpus_dirs_))
+        corpus_dirs_ = list(sorted(os.listdir(self.root_dir)))[-self.corpus_days:]
+
+        #corpus_dirs_ = sorted(filter(lambda x : x >= begin_day,  corpus_dirs_))
+
         if not with_today:
-            corpus_dirs_  = sorted(filter(lambda x : x < today,  corpus_dirs_))
+            # corpus_dirs_  = sorted(filter(lambda x : x < today,  corpus_dirs_))
+            corpus_dirs_ = corpus_dirs_[:-1]
         corpus_dirs  += [os.path.join(self.root_dir, x) for x in corpus_dirs_]
+        print(','.join(corpus_dirs))
 
         done_dirs    = []
         for day_corpus in corpus_dirs:
@@ -141,6 +146,9 @@ class PtDataset(IterableDataset):
             yield x
 
     def check_line(self, line):
+        return True
+
+    def check_line_bak(self, line):
         secs = line.strip().split(',')
         flag = False
         if len(secs) < 130:

@@ -14,7 +14,6 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from transformers import HfArgumentParser
-from torch.cuda.amp import GradScaler
 from torch import autocast
 from transformers import get_scheduler
 from torch.optim import AdamW, SparseAdam
@@ -205,8 +204,17 @@ def train(model_args, data_args, train_args):
     val_dataset = PtDataset("/mnt/video.rank.s101", pt_parser.parser, 0, with_today=True, batch_size=10000, shuffle_buffer_size=1000)
     val_dataloader = DataLoader(val_dataset, batch_size=None, num_workers=max(1, data_args.num_workers // 2), pin_memory=True)
 
-    # model
+    ### model
     model = RecModel.from_args(model_args).cuda(device)
+    #model = RecModel.from_args(model_args)
+    
+    #model.decoder.compile()
+    #model.encoder.compile()
+
+    #model.sparse_model = model.sparse_model.cpu()
+    #model.encoder = model.encoder.cuda(device)
+    #model.decoder = model.decoder.cuda(device)
+
 
     if use_distributed and torch.cuda.device_count() > 1:
         # 只封装dense部分
@@ -224,7 +232,7 @@ def train(model_args, data_args, train_args):
     # 构造 optimizer 
     optimizer_dense, optimizer_sparse = build_optimizers(model, train_args)
 
-    scaler = GradScaler(enabled=False)
+    scaler = torch.amp.GradScaler('cuda', enabled=False)
 
     lr_scheduler = get_scheduler( 
                 "constant_with_warmup", 
@@ -274,8 +282,10 @@ def train(model_args, data_args, train_args):
                 if batch is None:
                     is_dummy = True
                     batch = {k: v.cuda(device) for k, v in dummy_batch.items()}
+                    #batch = {k: v for k, v in dummy_batch.items()}
                 else:
                     batch = {k: v.cuda(device) for k, v in batch.items()}
+                    #batch = {k: v for k, v in batch.items()}
                     is_dummy = False
 
                 # with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=train_args.use_amp):
@@ -327,7 +337,9 @@ def train(model_args, data_args, train_args):
                                 logger.info(
                                         f"[{epoch}] step {global_step}, actual loss: {loss.item() * train_args.gradient_accumulation_steps:.4f}, target prob: {probs:.9f}, "
                                         f"avg mask valid rate {total_mask_valid_num / (data_args.batch_size * total_mask_valid_cnt * train_args.gradient_accumulation_steps):.4f}, "
-                                        f"avg final valid rate {total_final_valid_num / (data_args.batch_size * total_final_valid_cnt * train_args.gradient_accumulation_steps):.4f} "
+                                        f"avg final valid rate {total_final_valid_num / (data_args.batch_size * total_final_valid_cnt * train_args.gradient_accumulation_steps):.4f}, "
+                                        f"pos_pi_new: {model.decoder.pos_pi_new.result():.6f}, neg_pi_new: {model.decoder.neg_pi_new.result():.6f}, cts_pi_new: {model.decoder.cts_pi_new.result():.6f}, "
+                                        f"ct_loss: {model.decoder.loss_ct.result():.6f}, rl_loss: {model.decoder.loss_rl.result():.6f}"
                                     )
                                 total_mask_valid_num = 0 
                                 total_final_valid_num = 0

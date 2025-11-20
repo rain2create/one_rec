@@ -373,11 +373,11 @@ class PtParser:
 
         # sample weights
         w = np.ones_like(res['mask'], dtype=np.float32)
-        w = np.where(features['f029.like'] == '1', w+8.0, w)
-        w = np.where(features['f030.like_c'] == '1', w-2.0, w)
-        w = np.where(features['f090.favorite_c'] == '1', w-2.0, w)
-        w = np.where(features['f031.dislike'] == '1', w-2.0, w)
-        w = np.where(features['skip'] == 1.0, w-1.2, w)
+        w = np.where(features['f029.like'] == '1', w + 8.0, w)
+        w = np.where(features['f030.like_c'] == '1', w - 9.0, w)
+        w = np.where(features['f090.favorite_c'] == '1', w - 9.0, w)
+        w = np.where(features['f031.dislike'] == '1', w - 3.0, w)
+        w = np.where(features['skip'] == 1.0, w - 1.2, w)
         duration_w = np.log(res['duration'].numpy() + 1.0) - 1.0
         duration_w = duration_w / np.mean(duration_w)
         res['advantages'] = torch.from_numpy(w * duration_w)

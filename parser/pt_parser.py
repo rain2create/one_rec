@@ -15,6 +15,7 @@ import torch
 import xxhash
 from .tokenizer import UrlTokenizer 
 
+
 class PtParser:
     def __init__(self, column_def: List[tuple], tokenizer: UrlTokenizer):
         self.column_def = column_def 
@@ -256,7 +257,7 @@ class PtParser:
         logreallike_authorid_list = self._split_and_pad_fast(features["f093.logreallike_seqsFunc"], sep='|', pad_val='author_pad', max_len=30)
         logreallike_videotag_list = self._split_and_pad_fast(features["f097.logreallike_seqsVideotag"], sep='|', pad_val='tag_pad', max_len=30)
         logreallike_dur_list = self._split_and_pad_fast(features["f096.logreallike_seqsDuration"], sep='|', pad_val='0', max_len=30)
-        
+
         # res["logreallike_md5_list"] = features["f091.logreallike_seqsItem"]
         res["logreallike_md5"] = self._hash_to_tensor(logreallike_md5_list, vocab_size=20000019, seed=0, dtype=torch.int64)
         res["logreallike_qid"] = self._hash_to_tensor(logreallike_authorid_list, vocab_size=1000003, seed=0, dtype=torch.int64)
@@ -304,7 +305,7 @@ class PtParser:
         from_valid_up = np.where((features["f050.last_video"] == "1") & (zmtlink_label == 1.0), 1.0, from_valid_up)
         from_valid_up = np.where((features["f050.last_video"] == "1") & (follow_label == 1.0), 1.0, from_valid_up)
         from_valid_up = np.where((features["f050.last_video"] == "1") & (like_label == 1.0), 1.0, from_valid_up)
-        features["last_video_label"] = from_valid_up
+        features["from_valid_up"] = from_valid_up
 
         # finish_label
         finish = (features["f021.is_finish_video"] == "1").astype(np.float32)
@@ -321,13 +322,12 @@ class PtParser:
         alive = np.where(raw_dur < 9.0, 0.0, alive)
 
         # skip
-        skip_bound = np.where(raw_dur < 10.0, 2.0, 2.0)
+        skip_bound = np.where(raw_dur < 10.0, 2.0, 3.0)
         down_time = features['f024.manu_down_time'].astype(np.float32)
-        skip = np.where(down_time < skip_bound, 1.0, 0.0)
-        skip = np.where(down == 0.0, 0.0, skip)
-        skip = np.where(finish == 1.0, 0.0, skip)
-        skip = np.where(positive == 1.0, 0.0, skip)
-        # alive = np.where(skip == 1.0, 0.0, alive)
+        skip = np.where(down_time < skip_bound, '1', '0')
+        skip = np.where(down == 0.0, '0', skip)
+        skip = np.where(finish == 1.0, '0', skip)
+        skip = np.where(positive == 1.0, '0', skip)
         features['skip'] = skip
 
         # sign mask
@@ -371,27 +371,30 @@ class PtParser:
         # target url tokenizer
         res["url"] = self.url_tokenizer.batch_encode(features["f004.url"], add_bos=True)
 
-        # sample weights
-        w = np.ones_like(res['mask'], dtype=np.float32)
-        w = np.where(features['f029.like'] == '1', w + 8.0, w)
-        w = np.where(features['f030.like_c'] == '1', w - 9.0, w)
-        w = np.where(features['f090.favorite_c'] == '1', w - 9.0, w)
-        w = np.where(features['f031.dislike'] == '1', w - 3.0, w)
-        w = np.where(features['skip'] == 1.0, w - 1.2, w)
+        # advantages
+        w = np.zeros_like(res['mask'], dtype=np.float32)
+        w = np.where(features['f029.like'] == '1', w + 4, w)
+        w = np.where(features['f030.like_c'] == '1', w - 4, w)
+        w = np.where(features['f031.dislike'] == '1', w - 4, w)
+        w = np.where(features['f032.follow'] == '1', w + 4, w)
+        w = np.where(features['f033.authorpanel'] == '1', w + 1, w)
+        w = np.where(features['f089.favorite'] == '1', w + 4, w)
+        w = np.where(features['f090.favorite_c'] == '1', w - 4, w)
+        w = np.where(features['from_valid_up'] == 1.0, w + 0.5, w)
+        w = np.where(features['skip'] == '1', w - 0.2, w)
         duration_w = np.log(res['duration'].numpy() + 1.0) - 1.0
         duration_w = duration_w / np.mean(duration_w)
         res['advantages'] = torch.from_numpy(w * duration_w)
 
-        res['sample_weights'] = torch.sign(res['advantages'])
         res['pi_old'] = torch.exp(torch.rand(res['advantages'].size()[0]) - 6.0)
 
-        # loss th
-        th = np.zeros_like(res['mask'], dtype=np.float32)
-        th = np.where(features['skip'], 6.0, th)
-        th = np.where(features['f030.like_c'], 6.0, th)
-        th = np.where(features['f031.dislike'], 6.0, th)
-        th = np.where(features['f090.favorite_c'], 6.0, th)
-        res['loss_th'] = torch.from_numpy(th)
+        # # loss th
+        # th = np.zeros_like(res['mask'], dtype=np.float32)
+        # th = np.where(features['skip'], 6.0, th)
+        # th = np.where(features['f030.like_c'], 6.0, th)
+        # th = np.where(features['f031.dislike'], 6.0, th)
+        # th = np.where(features['f090.favorite_c'], 6.0, th)
+        # res['loss_th'] = torch.from_numpy(th)
 
         return res
 
@@ -416,7 +419,7 @@ class PtParser:
         """
         对 sample_weights > 0的数据采样, 占比alpha, 返回下标。
         """
-        idx_valid = (features['sample_weights'] > 0).nonzero(as_tuple=False).squeeze(-1)
+        idx_valid = (features['advantages'] > 0).nonzero(as_tuple=False).squeeze(-1)
         L         = int((alpha * idx_valid.numel()))
         perm      = torch.randperm(idx_valid.numel())
         indexes   = idx_valid[perm[:L]]
@@ -431,9 +434,9 @@ class PtParser:
             if k == 'url':
                 v_shuffle = v[url_indexes]
                 features[k] = torch.concat([v, v_shuffle], 0)
-            elif k == 'sample_weights': # 这里只取的正样本做对比学习
-                sampled_weights = v[fea_indexes]
-                features[k] = torch.concat([v, torch.ones_like(sampled_weights) * alpha], 0)
+            #elif k == 'sample_weights': # 这里只取的正样本做对比学习
+            #    sampled_weights = v[fea_indexes]
+            #    features[k] = torch.concat([v, torch.ones_like(sampled_weights) * alpha], 0)
             elif k == 'advantages':
                 advantages = v[url_indexes]
                 features[k] = torch.concat([v, torch.zeros_like(advantages)], 0)

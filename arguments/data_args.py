@@ -15,14 +15,15 @@ class DataArguments:
     # tokenizer
     codebook_layers: int = 3
     codebook_size: int = 1500
-    remote_mapping_file : str = '/data01/search/lusitong/dev/onerec_tokenizor/data/clustering_results'
+    remote_mapping_file : str = '/data01/search/lusitong/dev/onerec_tokenizor_sort/data/clustering_results'
     mapping_file: str = '../data/url_mapping'
     bos_token_id : int = 0
     unk_token_id : int = 1501
+    ensure_matrix_path : str = "../data/ensure_matrix.npy"
 
     # dataset
     #root_dir: str ="/mnt/video.rank.s101"
-    root_dir: str ="/mnt/video.rank.s101.pos_neg"
+    root_dir: str ="/mnt/video.rank.s101.pos_neg_test"
     corpus_days: int = 2
     with_today: bool = False
     batch_size: int = 1024

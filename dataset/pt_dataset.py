@@ -146,7 +146,37 @@ class PtDataset(IterableDataset):
             yield x
 
     def check_line(self, line):
-        return True
+        flag = False
+        secs = line.strip().split(',')
+        ## 10w sample
+        # likc_c, 442 + 20
+        if secs[29] == '1' or secs[89] == '1':
+            flag = True
+        # dislike, 107
+        if secs[30] == '1':
+            flag = True
+        # menudown time, skip: 8.9w -> 7.9w
+        if float(secs[23]) < 2.0 and secs[22] == '1':
+            if random.random() > 0.9:
+                flag = True
+            else:
+                flag = False
+        # from menu up, 2.4w, 2.9w -> 2.2w
+        if secs[49] == '1' and secs[20] == '1':
+            if random.random() > 0.5:
+                flag = True
+            else:
+                flag = False
+        # follow, 421
+        if secs[31] == '1':
+            flag = True
+        # like, 3397 + 672
+        if secs[28] == '1' or secs[88] == '1':
+            flag = True
+        # panel, 1641
+        if secs[32] == '1':
+            flag = True
+        return flag
 
     def check_line_bak(self, line):
         secs = line.strip().split(',')
@@ -171,7 +201,7 @@ class PtDataset(IterableDataset):
         # follow
         if secs[31] == '1':
             flag = True
-        # like
+        # like or fav
         if secs[28] == '1' or secs[88] == '1':
             flag = True
         # panel

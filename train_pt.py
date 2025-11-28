@@ -103,7 +103,8 @@ def load_checkpoint(model, optimizer_dense, optimizer_sparse, scaler, ckpt_path,
         if 'model' in checkpoint:
             sub_model = checkpoint['model']
             unwrap_module(model.encoder).load_state_dict(sub_model['encoder'])
-            unwrap_module(model.decoder).load_state_dict(sub_model['decoder'])
+            missing, unexpected = unwrap_module(model.decoder).load_state_dict(sub_model['decoder'], strict=False)
+            logger.info(f"Missing keys: {missing}")        # 只会打印，不会报错
             unwrap_module(model.sparse_model).load_state_dict(sub_model['sparse_model'])
         if optimizer_dense and 'optimizer_dense' in checkpoint:
             optimizer_dense.load_state_dict(checkpoint['optimizer_dense'])
@@ -128,7 +129,7 @@ def build_optimizers(model, train_args):
     sparse_params = []
     dense_decay_params = []
     dense_no_decay_params = []
-    
+
     sparse_param_names = set()
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Embedding) and module.sparse:
@@ -206,6 +207,10 @@ def train(model_args, data_args, train_args):
 
     ### model
     model = RecModel.from_args(model_args).cuda(device)
+    
+    ### load ensure_matrix
+    model.decoder._load_ensure_matrix(DataArguments.ensure_matrix_path)
+
     #model = RecModel.from_args(model_args)
     
     #model.decoder.compile()
@@ -238,14 +243,14 @@ def train(model_args, data_args, train_args):
                 "constant_with_warmup", 
                 optimizer=optimizer_dense,
                 num_warmup_steps=train_args.warmup_steps
-            )
+    )
 
     model.train()
     global_step = 0
 
     if train_args.resume_from_checkpoint:
         ckpt_path = os.path.join(train_args.output_dir, f"checkpoint-{train_args.resume_from_checkpoint}.pt")
-        global_step = load_checkpoint(model, optimizer_dense, optimizer_sparse, scaler, ckpt_path, logger, )['step']
+        global_step = load_checkpoint(model, optimizer_dense, optimizer_sparse, scaler, ckpt_path, logger,)['step']
         if use_distributed:
             dist.barrier()  # 所有 rank 同步
 

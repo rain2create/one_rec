@@ -9,6 +9,7 @@
 # ======================================================== 
 
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Union
@@ -59,6 +60,9 @@ class Decoder(nn.Module):
             for i in range(self.codebook_layers+1)
         ])
 
+        # 用来保证预估时候选在码本中
+        self.ensure_matrix = nn.Parameter(torch.zeros(self.codebook_layers-1, self.codebook_size+2, self.codebook_size+2), requires_grad=False)
+
         """
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.model_dim,
@@ -94,12 +98,24 @@ class Decoder(nn.Module):
             for i in range(self.codebook_layers):
                 self.output_layers[i].weight = self.embeddings[i+1].weight
 
+
         if not torch.jit.is_scripting():
             self.loss_rl = MeanMetric()
             self.loss_ct = MeanMetric()
             self.pos_pi_new = MeanMetric()
             self.neg_pi_new = MeanMetric()
             self.cts_pi_new = MeanMetric()
+
+    def _load_ensure_matrix(self, path: str):
+        mat = np.load(path)
+        tensor = torch.from_numpy(mat).float()
+        tensor = tensor.to(self.ensure_matrix.device)
+        if tensor.shape != self.ensure_matrix.shape:
+            print(f'形状不匹配：文件{tensor.shape} vs 参数{model.my_mat.shape}')
+        else:
+            with torch.no_grad():
+                self.ensure_matrix.copy_(tensor)
+                print('矩阵已加载并赋值: {}'.format(path))
 
     def _generate_square_subsequent_mask(self, sz: int):
         """Generate a square subsequent mask (upper triangular -inf)."""
@@ -119,35 +135,59 @@ class Decoder(nn.Module):
         B, slen = input_ids.size()
         D = self.model_dim
         V = self.output_layers[0].weight.size(0)
-
         # 1. tgt mask
         tgt_mask_ = self._generate_square_subsequent_mask(slen).to(input_ids.device)
-
         # 2. 获取 embeddings 权重堆叠成 Tensor: [L, V, D]
         emb_weights = torch.stack([emb.weight for emb in self.embeddings])  # [max_len, V_emb, D]
         input_embs = torch.empty(B, slen, D, device=input_ids.device)
         for i in range(slen):
             input_embs[:, i, :] = F.embedding(input_ids[:, i], emb_weights[i])
-
         # 3. transformer decoder forward
         decoder_out = self.transformer_decoder(
             input_embs, encoder_output, tgt_mask=tgt_mask_, memory_key_padding_mask=encoder_mask
         )  # [B, slen, D]
-
         # 4. 输出层权重堆叠成 Tensor: [L, V, D]
         out_weights = torch.stack([layer.weight for layer in self.output_layers])  # [max_len, V, D]
-
         # 5. 逐步计算 logits
         output_list = []
         for i in range(slen):
-            emb = F.normalize(decoder_out[:, i, :], dim=-1)          # [B, D]
+            emb = F.normalize(decoder_out[:, i, :], dim=-1)               # [B, D]
             weight = F.normalize(out_weights[i], dim=-1).transpose(0, 1)  # [D, V]
-            output_list.append(torch.matmul(emb, weight) * self.temperature)
-            """            
-            emb = decoder_out[:, i, :]
-            weight = out_weights[i].transpose(0, 1)
-            output_list.append(torch.matmul(emb, weight))
-            """
+            cur_l_logit = torch.matmul(emb, weight) * self.temperature    # [B, V]
+            output_list.append(cur_l_logit)
+        output_logits = torch.stack(output_list, dim=1)  # [B, slen, V]
+        return output_logits
+
+    def _compute_output_logits_mask(self, encoder_output: torch.Tensor, encoder_mask: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        _compute_output_logits的mask版本，通过mask logit提升反解率, 只在生成阶段使用。
+        """
+        B, slen = input_ids.size()
+        D = self.model_dim
+        V = self.output_layers[0].weight.size(0)
+        # 1. tgt mask
+        tgt_mask_ = self._generate_square_subsequent_mask(slen).to(input_ids.device)
+        # 2. 获取 embeddings 权重堆叠成 Tensor: [L, V, D]
+        emb_weights = torch.stack([emb.weight for emb in self.embeddings])  # [max_len, V_emb, D]
+        input_embs = torch.empty(B, slen, D, device=input_ids.device)
+        for i in range(slen):
+            input_embs[:, i, :] = F.embedding(input_ids[:, i], emb_weights[i])
+        # 3. transformer decoder forward
+        decoder_out = self.transformer_decoder(
+            input_embs, encoder_output, tgt_mask=tgt_mask_, memory_key_padding_mask=encoder_mask
+        )  # [B, slen, D]
+        # 4. 输出层权重堆叠成 Tensor: [L, V, D]
+        out_weights = torch.stack([layer.weight for layer in self.output_layers])  # [max_len, V, D]
+        # 5. 逐步计算 logits
+        output_list = []
+        for i in range(slen):
+            emb = F.normalize(decoder_out[:, i, :], dim=-1)               # [B, D]
+            weight = F.normalize(out_weights[i], dim=-1).transpose(0, 1)  # [D, V]
+            cur_l_logit = torch.matmul(emb, weight) * self.temperature    # [B, V]
+            if i == 1 or i == 2:
+                logit_bias = self.ensure_matrix[i-1][input_ids[:, -1]]    # [B, V]
+                cur_l_logit += logit_bias
+            output_list.append(cur_l_logit)
         output_logits = torch.stack(output_list, dim=1)  # [B, slen, V]
         return output_logits
 
@@ -161,7 +201,7 @@ class Decoder(nn.Module):
         返回:
             next_token: 采样结果 [B]
         """
-        
+
         if strategy == "greedy":
             next_token = torch.argmax(logits, dim=-1)
         elif strategy == "topk":
@@ -183,7 +223,7 @@ class Decoder(nn.Module):
             next_token = sorted_indices.gather(-1, next_token.unsqueeze(-1)).squeeze(-1)
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
-        
+
         return next_token
 
     @torch.jit.export
@@ -212,13 +252,28 @@ class Decoder(nn.Module):
         target_probs  = torch.gather(log_probs_all, 2, target_ids.unsqueeze(2)).squeeze(-1)      #[batch, 3]
         return target_probs
 
+    def entropy_from_logits(self, logits: torch.Tensor, eps=1e-12):
+        # logits: [B, V]
+        probs = F.softmax(logits, dim=-1)
+        logp = torch.log(probs + eps)
+        ent = -(probs * logp).sum(dim=-1)  # [B]
+        return ent.mean()  # scalar
+
     def rl_loss(self, features: Dict[str, torch.Tensor], pi_new: torch.Tensor):
-        pi_safe = torch.where(
-                features['advantages'] >= 0.0, 
-                torch.maximum(features['pi_old'], pi_new.detach()),
-                torch.maximum(features['pi_old'], 1.0 - pi_new.detach())
-        )
-        ratio = pi_new / pi_safe
+        # pi_safe = torch.where(
+        #     features['advantages'] >= 0.0, 
+        #     torch.maximum(features['pi_old'], pi_new),
+        #     torch.maximum(features['pi_old'], 1.0 - pi_new)
+        # )
+
+        pi_safe = torch.where(features['advantages'] > 0.0, pi_new, 1.0 - pi_new)
+        # pi_safe = torch.where(features['advantages'] > 0.0, pi_new, pi_new)
+
+        ratio = pi_new / pi_safe.detach()
+
+        # bound = pi_new / features['pi_old']
+        # ratio = torch.where((bound.detach() < 0.8) & (features['advantages'] < 0.0), 0.0, ratio)
+
         # print(
         #         'adv', features['advantages'][:3], 
         #         'pin', pi_new[:3],
@@ -229,10 +284,15 @@ class Decoder(nn.Module):
         #         'pis', pi_safe[-3:],
         #         'rat', ratio[-3:]
         # )
-        loss = -(ratio * features['advantages']).mean()
-        pos_pi_new = torch.where(features['advantages'] > 0, pi_new, 0.0).sum() / (torch.sum(features['advantages'] > 0) + 1e-6)
-        neg_pi_new = torch.where(features['advantages'] < 0, pi_new, 0.0).sum() / (torch.sum(features['advantages'] < 0) + 1e-6)
-        cts_pi_new = torch.where(features['advantages'] == 0, pi_new, 0.0).sum() / (torch.sum(features['advantages'] == 0) + 1e-6)
+
+        mask = (features['advantages'] != 0.0)
+        loss = -(ratio * features['advantages'])
+
+        loss = (loss * mask).sum() / (mask.sum().clamp_min(1))
+
+        pos_pi_new = torch.where(features['advantages']  > 0, pi_new, 0.0).sum() / ((features['advantages']  > 0).sum() + 1)
+        neg_pi_new = torch.where(features['advantages']  < 0, pi_new, 0.0).sum() / ((features['advantages']  < 0).sum() + 1)
+        cts_pi_new = torch.where(features['advantages'] == 0, pi_new, 0.0).sum() / ((features['advantages'] == 0).sum() + 1)
         self.pos_pi_new(pos_pi_new)
         self.neg_pi_new(neg_pi_new)
         self.cts_pi_new(cts_pi_new)
@@ -280,17 +340,34 @@ class Decoder(nn.Module):
             # loss = (loss * torch.abs(w)).mean()
 
             if not torch.jit.is_scripting():
-                # v2, 只有对比的部分
+                # v2, 只有对比的部分, adv>0: log_softmax, adv=0: 1-, adv<0: 0 (loss在强化部分)
                 loss_neg = - torch.log(1e-6 + 1.0 - torch.exp(loss * -1.0))
-                s = features['sample_weights'].repeat_interleave(3, dim=0)
-                loss = (torch.where(s > 0.0, loss, loss_neg)).mean()
+                s = features['advantages'].repeat_interleave(3, dim=0)
+                loss_neg = torch.where(s < 0.0, 0.0, loss_neg)
+                loss = torch.where(s > 0.0, loss, loss_neg).sum() / torch.sum(s >= 0).clamp_min(1)
                 self.loss_ct(loss)
+
+            ## balance_loss for new urls
+            #if not torch.jit.is_scripting():
+            #    output_logits_scd = output_logits[1::3]
+            #    loss += 0.2 * self.entropy_from_logits(output_logits_scd)
+            #    output_logits_thd = output_logits[2::3]
+            #    loss += 0.8 * self.entropy_from_logits(output_logits_scd)
 
             # 专家负载均衡loss
             if not torch.jit.is_scripting():
                 aux_loss = 0.01 * MANAGER.aggregate_aux_loss()
                 MANAGER.reset_aux_loss()
                 loss = loss + aux_loss
+
+            # v2, 强化部分，通过advantage 影响目标
+            if not torch.jit.is_scripting():
+                probs_ = F.log_softmax(output_logits.view(batch_size, seq_len_minus1, vocab_size), -1)
+                labels_ = labels.view(batch_size, seq_len_minus1)
+                probs_ = torch.exp(torch.gather(probs_, dim=2, index=labels_.unsqueeze(-1)).squeeze(-1).sum(dim=-1))
+                rl_loss = self.rl_loss(features, probs_)
+                loss = loss + rl_loss
+                self.loss_rl(rl_loss)
         else:
             # 返回0损失，保持梯度流通
             loss = (output_logits * 0.0).mean()
@@ -300,14 +377,6 @@ class Decoder(nn.Module):
         log_probs = F.log_softmax(output_logits, dim=-1)
         # [batch_size]
         probs = torch.exp(torch.gather(log_probs, dim=2, index=labels.unsqueeze(-1)).squeeze(-1).sum(dim=-1))
-
-        if not torch.jit.is_scripting():
-            # v2, 强化部分，通过advantage 影响目标
-            rl_loss = self.rl_loss(features, probs)
-            if not torch.jit.is_scripting():
-                if loss > 0.0:
-                    loss = loss + rl_loss
-                    self.loss_rl(rl_loss)
 
         # valid prob 
         mask_valid = mask.sum()
@@ -326,31 +395,23 @@ class Decoder(nn.Module):
                    strategy: str = "topp") -> Dict[str, torch.Tensor]:
         B = encoder_output.size(0)
         device = encoder_output.device
-
         # 使每个原始输入对应 group_num 个独立采样序列
         encoder_output = encoder_output.repeat_interleave(group_num, dim=0)  # [B*group_num, seq_len, hidden]
         encoder_mask   = encoder_mask.repeat_interleave(group_num, dim=0)    # [B*group_num, seq_len]
         new_B = B * group_num  # 新的batch size
-
         # 初始化bos_token
         input_ids = torch.full((new_B, 1), self.bos_token_id, dtype=torch.long, device=device)
-
         for step in range(self.codebook_layers):
             # 1. 计算对应位置的预测logits
-            output_logits = self._compute_output_logits(encoder_output, encoder_mask, input_ids)     #[batch, curlen, V]
-
+            output_logits = self._compute_output_logits_mask(encoder_output, encoder_mask, input_ids)     #[batch, curlen, V]
             # 2. 获取最后一个位置的logits
             last_logits = output_logits[:, -1, :]       # [new_b, V]
-            
             # 3. 根据logits采样得到token_id
             next_token = self._sample_from_logits(last_logits, strategy=strategy, top_p=top_p, top_k=top_k + step * 20)    #[new_b]
-    
             # 4. 将新采样得到的tokenid放入input_ids
             input_ids = torch.cat([input_ids, next_token.unsqueeze(1)], dim=1)  
-
         # 组装结果
         output_ids = input_ids[:, 1:]
-
         return {
             "output_ids": output_ids,
         }
@@ -375,41 +436,33 @@ class Decoder(nn.Module):
      
         for step in range(self.codebook_layers):
             # 1. 计算对应位置的预测logits
-            output_logits = self._compute_output_logits(encoder_output, encoder_mask, input_ids)     #[batch, curlen, V]
+            output_logits = self._compute_output_logits_mask(encoder_output, encoder_mask, input_ids)     #[batch, curlen, V]
             last_logits = output_logits[:, -1, :]       # [new_b, V]
-
             # 温度缩放，解决前两级别锁死的问题
-            last_logits = last_logits / last_logits.std()
-
+            # last_logits = last_logits / last_logits.std()
             # 2. 扩展候选
             log_probs_step = F.log_softmax(last_logits, dim=-1)
             topk_log_probs, topk_tokens = torch.topk(log_probs_step, group_num, dim=-1)  # [new_B, group_num]
-     
             # 3. 计算新分数,累计log_probs
             current_scores = scores.view(B, group_num)
             new_scores = current_scores.unsqueeze(2) + topk_log_probs.view(B, group_num, group_num)
             new_scores = new_scores.view(B, -1)  # [B, group_num*group_num]
-            
             if step != 0:
                 top_scores, top_indices = torch.topk(new_scores, group_num, dim=1)  # [B, group_num]
             else:
                 top_scores = new_scores[:, :group_num].clone()  # 或 .contiguous()
                 top_indices = torch.arange(group_num, device=device).expand(B, group_num)
-
             # 4. 计算重排索引
             old_beam_indices = top_indices // group_num  # [B, group_num]
             global_old_beam_indices = (torch.arange(B, device=device) * group_num).unsqueeze(1) + old_beam_indices
             global_old_beam_indices = global_old_beam_indices.view(-1)  # [B*group_num]
-     
             # 5. 重排状态
             input_ids = input_ids[global_old_beam_indices]  # [B*group_num, seq_len]
             logprobs = logprobs[global_old_beam_indices]
             scores = top_scores.view(-1)  # [B*group_num]
-     
             # 6. 获取选中的 token
             topk_tokens_flat = topk_tokens.view(B, -1)  # [B, group_num*group_num]
             selected_tokens = topk_tokens_flat.gather(1, top_indices).view(-1)  # [B*group_num]
-     
             topk_log_probs_flat = topk_log_probs.view(B, -1)
             selected_log_probs = topk_log_probs_flat.gather(1, top_indices).view(-1)  # [B*group_num]
             # 7. 更新 input_ids

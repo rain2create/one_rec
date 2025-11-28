@@ -57,7 +57,7 @@ dataloader = DataLoader(pt_dataset, batch_size=None, num_workers=1, pin_memory=T
 device = "cuda:0"
 model = RecModel.from_args(model_args)
 
-ckpt_path = "../data/pt_model/checkpoint-190000.pt"
+ckpt_path = "../data/pt_model/checkpoint-53168.pt"
 global_step = load_checkpoint(model, None, None, None, ckpt_path, logger, None)
 model = model.to(device)
 

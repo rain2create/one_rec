@@ -61,17 +61,26 @@ class UrlTokenizer:
             return os.system(f"cp {self.remote_mapping_file} {self.mapping_file}")	
 
     def init_mapping(self) -> int:
+        ensure_matrix = np.zeros([2, 1502, 1502]) * -1e3
+        # 假设是三层
+        def handle_ensure_matrix(ids):
+            if len(ids) < 3:
+                return
+            ensure_matrix[0][ids[0]][ids[1]] = 1.0
+            ensure_matrix[1][ids[1]][ids[2]] = 1.0
         # 从文件中读取 URL 到 token 的映射
         with open(self.mapping_file, 'r') as f:
             for line in f:
                 url, ids = line.strip().split("\t")
                 ids = list(map(int, ids.split(" ")))
+                handle_ensure_matrix(ids)
                 self.url2tokens[url] = ids
                 self.tokens2url[tuple(ids)].append(url)
                 # sample dict init
                 if ids[0] not in self.sample_dict:
                     self.sample_dict[ids[0]] = []
                 self.sample_dict[ids[0]].append(ids)
+        np.save(DataArguments.ensure_matrix_path, ensure_matrix)
         return 0
 
     def encode(self, url: str, add_bos) -> List[int]:

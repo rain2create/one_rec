@@ -88,7 +88,7 @@ class Decoder(nn.Module):
             norm_first=self.pre_norm,
             enable_moe=True,
         )
-        self.transformer_decoder = DecoderMOE(decoder_layer, num_layers=self.layer_num)
+        self.transformer_decoder = DecoderMOE(decoder_layer, num_layers=self.layer_num, d_model=self.model_dim)
 
         # output_layer为nn.ModuleList，每个位置一个Linear，权重与对应的embeddings共享
         self.output_layers = nn.ModuleList([
@@ -97,7 +97,6 @@ class Decoder(nn.Module):
         if self.weight_tying:
             for i in range(self.codebook_layers):
                 self.output_layers[i].weight = self.embeddings[i+1].weight
-
 
         if not torch.jit.is_scripting():
             self.loss_rl = MeanMetric()
@@ -187,6 +186,61 @@ class Decoder(nn.Module):
             if i == 1 or i == 2:
                 logit_bias = self.ensure_matrix[i-1][input_ids[:, -1]]    # [B, V]
                 cur_l_logit += logit_bias
+            output_list.append(cur_l_logit)
+        output_logits = torch.stack(output_list, dim=1)  # [B, slen, V]
+        return output_logits
+
+    def _compute_output_logits_mask_his(self, encoder_output: torch.Tensor, encoder_mask: torch.Tensor, input_ids: torch.Tensor, his_ids: torch.Tensor) -> torch.Tensor:
+        """
+        _compute_output_logits的mask版本，通过mask logit提升反解率, 只在生成阶段使用。
+        """
+        B, slen = input_ids.size()
+        D = self.model_dim
+        V = self.output_layers[0].weight.size(0)
+        # 1. tgt mask
+        tgt_mask_ = self._generate_square_subsequent_mask(slen).to(input_ids.device)
+        # 2. 获取 embeddings 权重堆叠成 Tensor: [L, V, D]
+        emb_weights = torch.stack([emb.weight for emb in self.embeddings])  # [max_len, V_emb, D]
+        input_embs = torch.empty(B, slen, D, device=input_ids.device)
+        for i in range(slen):
+            input_embs[:, i, :] = F.embedding(input_ids[:, i], emb_weights[i])
+        # 3. transformer decoder forward
+        decoder_out = self.transformer_decoder(
+            input_embs, encoder_output, tgt_mask=tgt_mask_, memory_key_padding_mask=encoder_mask
+        )  # [B, slen, D]
+        # 4. 输出层权重堆叠成 Tensor: [L, V, D]
+        out_weights = torch.stack([layer.weight for layer in self.output_layers])  # [max_len, V, D]
+        # 5. 逐步计算 logits
+        output_list = []
+        for i in range(slen):
+            emb = F.normalize(decoder_out[:, i, :], dim=-1)               # [B, D]
+            weight = F.normalize(out_weights[i], dim=-1).transpose(0, 1)  # [D, V]
+            cur_l_logit = torch.matmul(emb, weight) * self.temperature    # [B, V]
+            if i == 1 or i == 2:
+                logit_bias = self.ensure_matrix[i-1][input_ids[:, -1]]    # [B, V]
+                cur_l_logit += logit_bias
+            if i == 2:
+                his_ids = his_ids[0] # 假设当前只给一条预估
+                M = self.codebook_size+2
+                N = M * 5
+                his_matrix = torch.zeros(N, M).to(input_ids.device)
+                row_index = (his_ids[:, 0] * M + his_ids[:, 1]) % N
+                col_index = his_ids[:, 2]
+                his_matrix[row_index, col_index] = -1e3
+                logit_bias = his_matrix[(input_ids[:, -2] * M + input_ids[:, -1]) % N]
+                cur_l_logit += logit_bias
+            ''' batch version, test err
+            if i == 2:
+                M = self.codebook_size+2
+                N = M * 5
+                his_matrix = torch.zeros(B, N, M, device=input_ids.device)
+                b_idx = torch.arange(B, device=input_ids.device).view(-1, 1)
+                row_index = (his_ids[..., 0] * M + his_ids[..., 1]) % N
+                col_index = his_ids[..., 2]
+                his_matrix[b_idx, row_index, col_index] = -1e3
+                logit_bias = his_matrix[b_idx, (input_ids[:, -2] * M + input_ids[:, -1]) % N]
+                cur_l_logit += logit_bias
+            '''
             output_list.append(cur_l_logit)
         output_logits = torch.stack(output_list, dim=1)  # [B, slen, V]
         return output_logits
@@ -407,7 +461,7 @@ class Decoder(nn.Module):
             # 2. 获取最后一个位置的logits
             last_logits = output_logits[:, -1, :]       # [new_b, V]
             # 3. 根据logits采样得到token_id
-            next_token = self._sample_from_logits(last_logits, strategy=strategy, top_p=top_p, top_k=top_k + step * 20)    #[new_b]
+            next_token = self._sample_from_logits(last_logits, strategy=strategy, top_p=top_p + step * 0.1, top_k=top_k + step * 30)    #[new_b]
             # 4. 将新采样得到的tokenid放入input_ids
             input_ids = torch.cat([input_ids, next_token.unsqueeze(1)], dim=1)  
         # 组装结果
@@ -478,6 +532,67 @@ class Decoder(nn.Module):
             "output_logprobs": log_probs
         }
 
+    @torch.jit.export
+    def bs_rl_generate_mask(self,
+                       encoder_output: torch.Tensor,
+                       encoder_mask: torch.Tensor,
+                       his_code: torch.Tensor, group_num: int = 5) -> Dict[str, torch.Tensor]:
+        B = encoder_output.size(0)
+        device = encoder_output.device
+        new_B = B * group_num
+
+        # 只缓存 token ids，不缓存 embeddings
+        input_ids = torch.full((new_B, 1), self.bos_token_id, dtype=torch.long, device=device)
+        logprobs = torch.full((new_B, 1), 0., dtype=torch.float32, device=device)
+        scores = torch.zeros(new_B, device=device)
+
+        # repeat encoder_output & mask by group_size
+        encoder_output = encoder_output.repeat_interleave(group_num, dim=0)
+        encoder_mask = encoder_mask.repeat_interleave(group_num, dim=0)
+     
+        for step in range(self.codebook_layers):
+            # 1. 计算对应位置的预测logits
+            output_logits = self._compute_output_logits_mask_his(encoder_output, encoder_mask, input_ids, his_code)     #[batch, curlen, V]
+            last_logits = output_logits[:, -1, :]       # [new_b, V]
+            # 温度缩放，解决前两级别锁死的问题
+            # last_logits = last_logits / last_logits.std()
+            # 2. 扩展候选
+            log_probs_step = F.log_softmax(last_logits, dim=-1)
+            topk_log_probs, topk_tokens = torch.topk(log_probs_step, group_num, dim=-1)  # [new_B, group_num]
+            # 3. 计算新分数,累计log_probs
+            current_scores = scores.view(B, group_num)
+            new_scores = current_scores.unsqueeze(2) + topk_log_probs.view(B, group_num, group_num)
+            new_scores = new_scores.view(B, -1)  # [B, group_num*group_num]
+            if step != 0:
+                top_scores, top_indices = torch.topk(new_scores, group_num, dim=1)  # [B, group_num]
+            else:
+                top_scores = new_scores[:, :group_num].clone()  # 或 .contiguous()
+                top_indices = torch.arange(group_num, device=device).expand(B, group_num)
+            # 4. 计算重排索引
+            old_beam_indices = top_indices // group_num  # [B, group_num]
+            global_old_beam_indices = (torch.arange(B, device=device) * group_num).unsqueeze(1) + old_beam_indices
+            global_old_beam_indices = global_old_beam_indices.view(-1)  # [B*group_num]
+            # 5. 重排状态
+            input_ids = input_ids[global_old_beam_indices]  # [B*group_num, seq_len]
+            logprobs = logprobs[global_old_beam_indices]
+            scores = top_scores.view(-1)  # [B*group_num]
+            # 6. 获取选中的 token
+            topk_tokens_flat = topk_tokens.view(B, -1)  # [B, group_num*group_num]
+            selected_tokens = topk_tokens_flat.gather(1, top_indices).view(-1)  # [B*group_num]
+            topk_log_probs_flat = topk_log_probs.view(B, -1)
+            selected_log_probs = topk_log_probs_flat.gather(1, top_indices).view(-1)  # [B*group_num]
+            # 7. 更新 input_ids
+            input_ids = torch.cat([input_ids, selected_tokens.unsqueeze(1)], dim=1)  # [B*group_num, seq_len+1]
+            logprobs = torch.cat([logprobs, selected_log_probs.unsqueeze(1)], dim=1)  # [B*group_num, seq_len+1]
+
+        # 12. 输出
+        output_ids = input_ids[:, 1:]  # 去掉 bos
+        log_probs = logprobs[:, 1:]
+     
+        return {
+            "output_ids": output_ids,
+            "output_logprobs": log_probs
+        }
 
    
 

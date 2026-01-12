@@ -13,7 +13,7 @@ from typing import Dict
 @dataclass
 class ModelArguments:
     # encoder
-    emb_dim: int = 64
+    emb_dim: int = 128
     model_dim: int = 256
     encoder_num_layers: int = 6
     encoder_num_heads: int = 4
@@ -26,7 +26,7 @@ class ModelArguments:
             "autok": 11, 
             "autoplay": 3, 
             "reqtimes": 30, 
-            "md5": 20000019,
+            #"md5": 20000019,
             "qid": 1000003,
             "videotag": 10007,
             "timegap": 30,

@@ -50,21 +50,21 @@ class Encoder(nn.Module):
 
         # dense(leakyrelu(dense))
         self.logsess_proj = nn.Sequential(
-            nn.Linear(len(self.logsess_features) * self.emb_dim, self.model_dim),
+            nn.Linear(len(self.logsess_features) * self.emb_dim + self.emb_dim * 2, self.model_dim),
             nn.LeakyReLU(),
             nn.Linear(self.model_dim, self.model_dim)
         )
 
         # dense(leakyrelu(dense))
         self.logqueue_proj = nn.Sequential(
-            nn.Linear(len(self.logqueue_features) * self.emb_dim, self.model_dim),
+            nn.Linear(len(self.logqueue_features) * self.emb_dim + self.emb_dim * 2, self.model_dim),
             nn.LeakyReLU(),
             nn.Linear(self.model_dim, self.model_dim)
         )
 
         # dense(leakyrelu(dense))
         self.logreallike_proj = nn.Sequential(
-            nn.Linear(len(self.logreallike_features) * self.emb_dim, self.model_dim),
+            nn.Linear(len(self.logreallike_features) * self.emb_dim + self.emb_dim * 2, self.model_dim),
             nn.LeakyReLU(),
             nn.Linear(self.model_dim, self.model_dim)
         )

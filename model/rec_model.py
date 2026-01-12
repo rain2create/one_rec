@@ -87,13 +87,16 @@ class RecModel(nn.Module):
         att_emb, att_mask = self.encoder(features, feature_embeddings)
         output_rl = self.decoder.bs_rl_generate(att_emb, att_mask, group_num)
         return output_rl
-    
+
     @torch.jit.export
     def generate(self, features: Dict[str, torch.Tensor], group_num: int = 1):
         feature_embeddings = self.sparse_model(features)
         att_emb, att_mask = self.encoder(features, feature_embeddings)
-        output_rl = self.decoder.bs_rl_generate(att_emb, att_mask, group_num)
-        # output_rl = self.decoder.rl_generate(att_emb, att_mask, group_num=group_num)
+        his_code = features['pv_list']
+        #output_rl = self.decoder.bs_rl_generate(att_emb, att_mask, group_num)
+        #output_rl = self.decoder.bs_rl_generate_mask(att_emb, att_mask, his_code[0], group_num)
+        output_rl = self.decoder.bs_rl_generate_mask(att_emb, att_mask, his_code, group_num)
+        #output_rl = self.decoder.rl_generate(att_emb, att_mask, group_num=group_num)
         return output_rl
 
     @torch.jit.export

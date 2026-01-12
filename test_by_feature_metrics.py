@@ -57,7 +57,7 @@ dataloader = DataLoader(pt_dataset, batch_size=None, num_workers=1, pin_memory=T
 device = "cuda:0"
 model = RecModel.from_args(model_args)
 
-ckpt_path = "../data/pt_model/checkpoint-53168.pt"
+ckpt_path = "../data/pt_model/checkpoint-52938.pt"
 global_step = load_checkpoint(model, None, None, None, ckpt_path, logger, None)
 
 model = model.to(device)
@@ -68,25 +68,39 @@ def cal_hits(his_ids, r_ids):
     his_set = set(his_ids.tolist())
     return len(his_set), len(his_set & set(r_ids))
 
-metrics = [0] * 7
+metrics = [0] * 10
 urls_recall = set()
+
+
+# load pool
+def load_pool():
+    res = set()
+    with open('../data/url_mapping_concat') as ip:
+        for line in ip:
+            secs = line.strip().split('\t')
+            res.add(secs[0])
+    return res
+#pool_urls = load_pool()
+pool_urls = set()
+
 
 for i, x in enumerate(dataloader):
     if i > 50000:
         break
 
     inputs = {k:v.to(device) for k, v in x.items()}
-
     #print(inputs)
+
     loglik_ids = inputs['logreallike_md5'][0]
     logque_ids = inputs['logque_md5'][0]
     logses_ids = inputs['logsess_md5'][0]
 
     with torch.no_grad():
         res = model.generate(inputs, group_num=100)
-    # res = model.rl_generate(inputs, group_num=100, top_k=20, top_p=0.1, strategy='topp')
+        # res = model.rl_generate(inputs, group_num=100, top_k=10, top_p=0.1, strategy='topp')
     output_ids = res["output_ids"].detach().cpu()
     # log_probs = res["output_logprobs"].sum(dim=-1)
+    print(res)
 
     urls = url_tokenizer.batch_decode(output_ids)
     urls_hashid = pt_parser._hash_to_tensor(np.asarray(urls), 20000019).tolist()
@@ -103,7 +117,12 @@ for i, x in enumerate(dataloader):
     metrics[4] += a
     metrics[5] += b
     metrics[6] = len(urls_recall)
-    if i % 1000 == 0:
+
+    ## 反解率
+    metrics[7] += len(urls)
+    metrics[8] += len([url for url in urls if url != ''])
+    metrics[9] += len([url for url in urls if url in pool_urls])
+    if i % 100 == 0:
         print(metrics)
 
     #for x, p, url, hshid in zip(output_ids.tolist(), log_probs.tolist(), urls, urls_hashid):

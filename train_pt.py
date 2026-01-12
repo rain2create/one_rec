@@ -202,7 +202,7 @@ def train(model_args, data_args, train_args):
         val_dataloader = DataLoader(val_dataset, batch_size=None, num_workers=max(1, data_args.num_workers // 2), pin_memory=True)
 
     # 构造val dataloader
-    val_dataset = PtDataset("/mnt/video.rank.s101", pt_parser.parser, 0, with_today=True, batch_size=10000, shuffle_buffer_size=1000)
+    val_dataset = PtDataset("/mnt_onerec_model/corpus/video.rank.s101.pos_neg_test", pt_parser.parser, 0, with_today=True, batch_size=10000, shuffle_buffer_size=1000)
     val_dataloader = DataLoader(val_dataset, batch_size=None, num_workers=max(1, data_args.num_workers // 2), pin_memory=True)
 
     ### model

@@ -7,8 +7,8 @@
 #   date     : 2025-11-11
 #   desc     :
 # ========================================================
-import torch, torch.nn as nn
-#from model.moe_auxloss import MoeFFN
+import torch
+import torch.nn as nn
 from model.moe_auxloss import MOELayer, MOEConfig
 from typing import Any, Callable, Optional, Union
 from torch import Tensor
@@ -68,51 +68,6 @@ def _detect_is_causal_mask(
     return make_causal
 
 
-class DecoderMOE(TransformerDecoder):
-
-    def __init__(
-        self,
-        decoder_layer: "DecoderLayerMOE",
-        num_layers: int,
-        norm: Optional[TransformerDecoder] = None,
-    ) -> None:
-        super().__init__(decoder_layer=decoder_layer,num_layers=num_layers,norm=norm)
-
-    def forward(
-        self,
-        tgt: Tensor,
-        memory: Tensor,
-        tgt_mask: Optional[Tensor] = None,
-        memory_mask: Optional[Tensor] = None,
-        tgt_key_padding_mask: Optional[Tensor] = None,
-        memory_key_padding_mask: Optional[Tensor] = None,
-        tgt_is_causal: Optional[bool] = None,
-        memory_is_causal: bool = False,
-    ) -> Tensor:
-
-        output = tgt
-
-        seq_len = _get_seq_len(tgt, self.layers[0].self_attn.batch_first)
-        tgt_is_causal = _detect_is_causal_mask(tgt_mask, tgt_is_causal, seq_len)
-
-        for mod in self.layers:
-            output = mod(
-                output,
-                memory,
-                tgt_mask=tgt_mask,
-                memory_mask=memory_mask,
-                tgt_key_padding_mask=tgt_key_padding_mask,
-                memory_key_padding_mask=memory_key_padding_mask,
-                tgt_is_causal=tgt_is_causal,
-                memory_is_causal=memory_is_causal,
-            )
-
-        if self.norm is not None:
-            output = self.norm(output)
-
-        return output
-
-
 class DecoderLayerMOE(TransformerDecoderLayer):
 
     def __init__(
@@ -137,19 +92,79 @@ class DecoderLayerMOE(TransformerDecoderLayer):
         self.enable_moe = enable_moe
         if self.enable_moe:
             self.moe = MOELayer(self.moe_config)
-        '''
-        self.moe = MoeFFN(
-                d_model, 
-                num_experts=num_experts,
-                top_k=top_k,
-                dim_feedforward=dim_feedforward
+
+        # 注意：cross-attn 不再有自己的 K/V 投影
+        self.multihead_attn = None
+        self.q_proj = nn.Linear(d_model, d_model, bias=True)
+        self.out_proj = nn.Linear(d_model, d_model, bias=True)
+
+    def _mha_block(self, x: Tensor, shared_k: Tensor, shared_v: Tensor, attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool=False):
+        q = self.q_proj(x)
+        out = F.scaled_dot_product_attention(
+            q, shared_k, shared_v,
+            attn_mask=attn_mask,
+            dropout_p=0.1,
+            is_causal=is_causal
+        )
+        return self.dropout2(self.out_proj(out))
+
+    '''
+    def _mha_block(self, x: Tensor, mem: Tensor, attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool = False):
+        """
+        Implements Lazy KV-Sharing:
+        - Compute K/V only once
+        - Each layer only computes Q
+        """
+
+        # MultiheadAttention weights
+        mha = self.multihead_attn
+        W = mha.in_proj_weight     # shape [3*d_model, d_model]
+        b = mha.in_proj_bias
+        E = mha.embed_dim
+
+        # ------------------------------
+        # 1. Build memory K/V once
+        # ------------------------------
+        if self._memory_k is None or self._memory_v is None:
+            # K = W_k * mem
+            self._memory_k = F.linear(
+                mem,
+                W[E:2*E],    # W_k
+                b[E:2*E]
             )
-        '''
+            # V = W_v * mem
+            self._memory_v = F.linear(
+                mem,
+                W[2*E:3*E],  # W_v
+                b[2*E:3*E]
+            )
+
+        # ------------------------------
+        # 2. Compute Q every layer
+        # ------------------------------
+        q = F.linear(x,
+                     W[0:E],     # W_q
+                     b[0:E])
+
+        # ------------------------------
+        # 3. SDPA Attention: Q × (KV cache)
+        # ------------------------------
+        attn_out = torch.nn.functional.scaled_dot_product_attention(
+            q, self._memory_k, self._memory_v,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=is_causal
+        )
+        # Output projection
+        out = mha.out_proj(attn_out)
+        return self.dropout2(out)
+    '''
 
     def forward(
         self,
         tgt: Tensor,
-        memory: Tensor,
+        shared_k: Tensor,
+        shared_v: Tensor,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         tgt_key_padding_mask: Optional[Tensor] = None,
@@ -165,7 +180,8 @@ class DecoderLayerMOE(TransformerDecoderLayer):
             )
             x = x + self._mha_block(
                 self.norm2(x),
-                memory,
+                shared_k,
+                shared_v,
                 memory_mask,
                 memory_key_padding_mask,
                 memory_is_causal,
@@ -182,7 +198,12 @@ class DecoderLayerMOE(TransformerDecoderLayer):
             x = self.norm2(
                 x
                 + self._mha_block(
-                    x, memory, memory_mask, memory_key_padding_mask, memory_is_causal
+                    x,
+                    shared_k,
+                    shared_v,
+                    memory_mask,
+                    memory_key_padding_mask,
+                    memory_is_causal,
                 )
             )
             if self.enable_moe:
@@ -192,6 +213,75 @@ class DecoderLayerMOE(TransformerDecoderLayer):
                 x = self.norm3(x + self._ff_block(x))
 
         return x
+
+
+class SharedMemoryKV(nn.Module):
+    """
+    Project memory to shared K / V (used by all decoder layers)
+    """
+    def __init__(self, d_model):
+        super().__init__()
+        self.k_proj = nn.Linear(d_model, d_model, bias=True)
+        # self.v_proj = nn.Linear(d_model, d_model, bias=True)
+
+    def forward(self, memory):
+        """
+        memory: [B, M, D]
+        """
+        k = self.k_proj(memory)
+        #v = self.v_proj(memory)
+        v = k
+        return k, v
+
+
+class DecoderMOE(TransformerDecoder):
+
+    def __init__(
+        self,
+        decoder_layer: "DecoderLayerMOE",
+        num_layers: int,
+        d_model: int,
+        norm: Optional[TransformerDecoder] = None,
+    ) -> None:
+        super().__init__(decoder_layer=decoder_layer,num_layers=num_layers,norm=norm)
+        self.shared_kv_layer = SharedMemoryKV(d_model=d_model)
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        tgt_mask: Optional[Tensor] = None,
+        memory_mask: Optional[Tensor] = None,
+        tgt_key_padding_mask: Optional[Tensor] = None,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        tgt_is_causal: Optional[bool] = None,
+        memory_is_causal: bool = False,
+    ) -> Tensor:
+
+        output = tgt
+
+        seq_len = _get_seq_len(tgt, self.layers[0].self_attn.batch_first)
+        tgt_is_causal = _detect_is_causal_mask(tgt_mask, tgt_is_causal, seq_len)
+
+        shared_k, shared_v = self.shared_kv_layer(memory)
+
+        for mod in self.layers:
+            output = mod(
+                output,
+                shared_k,
+                shared_v,
+                tgt_mask=tgt_mask,
+                memory_mask=memory_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_is_causal=tgt_is_causal,
+                memory_is_causal=memory_is_causal,
+            )
+
+        if self.norm is not None:
+            output = self.norm(output)
+
+        return output
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ from .tokenizer import UrlTokenizer
 
 
 class PtParser:
+
     def __init__(self, column_def: List[tuple], tokenizer: UrlTokenizer):
         self.column_def = column_def 
         self.col_num = len(column_def)
@@ -204,7 +205,7 @@ class PtParser:
         logsess_dwell_list = self._preprocess_dwell(logsess_dwell_list, logsess_dur_list)  # 处理用户观看时长
         logsess_label_list = self._split_and_pad_fast(features["f047.logsess_att_seqs"], sep='|', pad_val='0', max_len=30)
 
-        res["logsess_md5"] = self._hash_to_tensor(logsess_md5_list, vocab_size=20000019, seed=0, dtype=torch.int64)
+        #res["logsess_md5"] = self._hash_to_tensor(logsess_md5_list, vocab_size=20000019, seed=0, dtype=torch.int64)
         res["logsess_qid"] = self._hash_to_tensor(logsess_qid_list, vocab_size=1000003, seed=0, dtype=torch.int64)
         res["logsess_videotag"] = self._hash_to_tensor(logsess_videotag_list, vocab_size=10007, seed=0, dtype=torch.int64)
         res["logsess_timegap"] = self._bucketize(logtime_expanded - self._to_tensor(logsess_timestamp_list), self.timestamp_gap_boundaries_logsess)
@@ -212,6 +213,8 @@ class PtParser:
         res["logsess_dwell"] = self._bucketize(self._to_tensor(logsess_dwell_list, pad_val=0, np_dtype=np.float32), self.dwell_boundaries)
         res["logsess_label"] = self._hash_to_tensor(logsess_label_list, vocab_size=100019, seed=0, dtype=torch.int64)
         res["logsess_mask"] = self._str_not_eq(logsess_md5_list, 'url_pad')  # mask: pad token为0, 其他为1
+
+        res['logsess_lmcode'] = self.url_tokenizer.seq_encode(logsess_md5_list)
         return res
 
     def preprocess_logqueue_features(
@@ -235,8 +238,8 @@ class PtParser:
         logque_dwell_list = self._preprocess_dwell(logque_dwell_list, logque_dur_list)  # 处理用户观看时长
         logque_label_list = self._split_and_pad_fast(features["f082.logQue_seqsAtt"], sep='|', pad_val='0', max_len=30)
 
-        # res["logque_md5_list"] = features["f080.logQue_seqsItem"]
-        res["logque_md5"] = self._hash_to_tensor(logque_md5_list, vocab_size=20000019, seed=0, dtype=torch.int64)
+        #res["logque_md5_list"] = features["f080.logQue_seqsItem"]
+        #res["logque_md5"] = self._hash_to_tensor(logque_md5_list, vocab_size=20000019, seed=0, dtype=torch.int64)
         res["logque_qid"] = self._hash_to_tensor(logque_qid_list, vocab_size=1000003, seed=0, dtype=torch.int64)
         res["logque_videotag"] = self._hash_to_tensor(logque_videotag_list, vocab_size=10007, seed=0, dtype=torch.int64)
         res["logque_timegap"] = self._bucketize(logtime_expanded - self._to_tensor(logque_timestamp_list), self.timestamp_gap_boundaries_logsess)
@@ -244,6 +247,13 @@ class PtParser:
         res["logque_dwell"] = self._bucketize(self._to_tensor(logque_dwell_list, pad_val=0, np_dtype=np.float32), self.dwell_boundaries)
         res["logque_label"] = self._hash_to_tensor(logque_label_list, vocab_size=100019, seed=0, dtype=torch.int64)
         res["logque_mask"] = self._str_not_eq(logque_md5_list, 'url_pad')  # mask: pad token为0, 其他为1
+
+        # 判断是否命中历史
+        hit_his = np.any(logque_videotag_list[:, :12] == features["f008.videotag"][:, None], axis=1)
+        #print(type(logque_videotag_list), type(features["f008.videotag"]), logque_videotag_list[:2], features["f008.videotag"][:2], hit_his[:2])
+        res['hit_histag_logque'] = torch.from_numpy(hit_his).bool()
+
+        res['logque_lmcode'] = self.url_tokenizer.seq_encode(logque_md5_list)
         return res
 
     def preprocess_logreallike_features(self, features: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
@@ -259,11 +269,13 @@ class PtParser:
         logreallike_dur_list = self._split_and_pad_fast(features["f096.logreallike_seqsDuration"], sep='|', pad_val='0', max_len=30)
 
         # res["logreallike_md5_list"] = features["f091.logreallike_seqsItem"]
-        res["logreallike_md5"] = self._hash_to_tensor(logreallike_md5_list, vocab_size=20000019, seed=0, dtype=torch.int64)
+        #res["logreallike_md5"] = self._hash_to_tensor(logreallike_md5_list, vocab_size=20000019, seed=0, dtype=torch.int64)
         res["logreallike_qid"] = self._hash_to_tensor(logreallike_authorid_list, vocab_size=1000003, seed=0, dtype=torch.int64)
         res["logreallike_videotag"] = self._hash_to_tensor(logreallike_videotag_list, vocab_size=10007, seed=0, dtype=torch.int64)
         res["logreallike_duration"] = self._bucketize(self._to_tensor(logreallike_dur_list, pad_val=0, np_dtype=np.float32), self.duration_boundaries)
         res["logreallike_mask"] = self._str_not_eq(logreallike_md5_list, 'url_pad') # mask: pad token为0, 其他为1
+
+        res['logreallike_lmcode'] = self.url_tokenizer.seq_encode(logreallike_md5_list)
         return res
 
     def sample_mask(self, features: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
@@ -330,6 +342,11 @@ class PtParser:
         skip = np.where(positive == 1.0, '0', skip)
         features['skip'] = skip
 
+        # real_duration(finish_time or menudown_time)
+        real_duration = np.ones_like(raw_dur) * np.mean(down_time)
+        real_duration = np.where(features["f021.is_finish_video"] == "1", raw_dur, real_duration)
+        real_duration = np.where(features["f023.is_manu_down"] == "1", down_time, real_duration)
+
         # sign mask
         if not self.valid_sign:
             sign_mask = np.ones(features["f001.sign"].shape, dtype=bool)
@@ -345,7 +362,16 @@ class PtParser:
         features['weight'] = np.ones_like(alive, dtype=np.float32)
 
         # 1 表示alive有效样本, 0表示dead
-        return {"mask": torch.from_numpy(features['weight'].astype(np.int64)), "duration": torch.from_numpy(raw_dur)}
+        return {"mask": torch.from_numpy(features['weight'].astype(np.int64)), "duration": torch.from_numpy(raw_dur), "real_duration": torch.from_numpy(real_duration)}
+
+    def duration_adv(self, raw_duration: torch.Tensor, real_duration: torch.Tensor, pos_th=0.2, eps=1e-3):
+        r = torch.log1p(real_duration) / torch.log1p(raw_duration + eps)
+        r = torch.where(real_duration < 2.0, 0.0, r)
+        advantage = torch.zeros_like(r)
+        k = max(1, int(pos_th * r.numel()))
+        topk_vals, topk_idx = torch.topk(r, k)
+        advantage[topk_idx] = 1.0
+        return advantage
 
     def extract_features(self, features: Dict[str, np.ndarray]) -> Dict[str, Union[torch.Tensor, np.ndarray]]:
         res = {}
@@ -371,7 +397,7 @@ class PtParser:
         # target url tokenizer
         res["url"] = self.url_tokenizer.batch_encode(features["f004.url"], add_bos=True)
 
-        # advantages
+        ### advantages
         w = np.zeros_like(res['mask'], dtype=np.float32)
         w = np.where(features['f029.like'] == '1', w + 4, w)
         w = np.where(features['f030.like_c'] == '1', w - 4, w)
@@ -381,10 +407,17 @@ class PtParser:
         w = np.where(features['f089.favorite'] == '1', w + 4, w)
         w = np.where(features['f090.favorite_c'] == '1', w - 4, w)
         w = np.where(features['from_valid_up'] == 1.0, w + 0.5, w)
+        w = np.where(features['f021.is_finish_video'] == '1', w + 0.4, w)
         w = np.where(features['skip'] == '1', w - 0.2, w)
-        duration_w = np.log(res['duration'].numpy() + 1.0) - 1.0
-        duration_w = duration_w / np.mean(duration_w)
-        res['advantages'] = torch.from_numpy(w * duration_w)
+        # 正样本中，没命中历史tag * 2
+        w[(w > 0) & (~res['hit_histag_logque'].detach().numpy())] *= 2.0
+
+        #duration_w = np.log(res['duration'].numpy() + 1.0) - 1.0
+        #duration_w = duration_w / np.mean(duration_w)
+        #res['advantages'] = torch.from_numpy(w * duration_w)
+        
+        w_dua = self.duration_adv(res['duration'], res['real_duration'])
+        res['advantages'] = torch.from_numpy(w) + w_dua
 
         res['pi_old'] = torch.exp(torch.rand(res['advantages'].size()[0]) - 6.0)
 
@@ -444,11 +477,7 @@ class PtParser:
                 v_shuffle = v[fea_indexes]
                 features[k] = torch.concat([v, v_shuffle], 0)
 
-    def expand_pos(self, features, alpha = 0.1):
-        ## v1
-        # indexes = torch.randperm(features['url'].size(0))[:int(alpha * features['url'].size(0))]
-
-        ## v2
+    def expand_pos(self, features, alpha=0.1):
         indexes = self.sample_index(features, alpha)
 
         for k, v in features.items():
@@ -458,6 +487,9 @@ class PtParser:
                 for url_token in urls_target_cls:
                     res.append(self.url_tokenizer.sample_from_cls(url_token, add_bos=True))
                 features[k] = torch.concat([v, torch.tensor(res, dtype=torch.long)], 0)
+            elif k == 'advantages':
+                advantages = v[indexes]
+                features[k] = torch.concat([v, torch.ones_like(advantages)], 0)
             else:
                 features[k] = torch.concat([v, v[indexes]], 0)
 
@@ -480,7 +512,7 @@ class PtParser:
         features = self.extract_features(features)
 
         ## 扩展样本
-        #self.expand_pos(features, 0.1)
+        self.expand_pos(features, 0.5)
 
         ## 负样本
         self.expand_neg(features, -1.0)
@@ -491,24 +523,9 @@ class PtParser:
 if __name__ == "__main__":
     import gzip
     from utils.column import columns_def
+    from parser.tokenizer import UrlTokenizer
+    from arguments.data_args import DataArguments
+    data_args = DataArguments()
+    url_tokenizer = UrlTokenizer.from_args(data_args)
+    pt_parser = PtParser(data_args.columns_def, tokenizer=url_tokenizer)
 
-    url_tokenizer = UrlTokenizer(layers=3, codebook_size=1500, \
-                                remote_mapping_file="/data01/search/lusitong/dev/onerec_tokenizor/data/clustering_results", \
-                                mapping_file="../data/url_mapping", bos_token_id=0, unk_token_id=1501)
-    pt_parser = PtParser(columns_def, tokenizer=url_tokenizer)
-
-    file_path = "/mnt/video.rank.s101/20250710/2025071011/20250710-11-38506.gz"
-    batch_lines = []
-    batch_size = 32
-    with gzip.open(file_path, "rt", encoding="utf-8") as f, open("./raw_lines", "w") as g:
-        for line in f:
-            line = line.strip()
-            batch_lines.append(line)
-            for x in batch_lines:
-                g.write(x + "\n")
-            if len(batch_lines) == batch_size:
-                # 处理一批数据
-                features = pt_parser.parser(batch_lines)
-                for k in features:
-                    print(k, features[k])
-                break

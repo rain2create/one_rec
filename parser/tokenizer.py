@@ -95,18 +95,36 @@ class UrlTokenizer:
             return [self.bos_token_id] + tokens
         return tokens
 
+    def seq_encode(self, seq_urls: np.ndarray) -> torch.Tensor:
+        try:
+            B, L = seq_urls.shape
+            res = np.zeros([B, L, 3], dtype=np.int32)
+            for i in range(seq_urls.shape[0]):
+                for j in range(seq_urls.shape[1]):
+                    res[i][j] = self.encode(seq_urls[i][j], add_bos=False)
+        except Exception as err:
+            print(err)
+        return torch.from_numpy(res)
+
     def sample_from_cls(self, tokens: List[int], add_bos) -> List[int]:
         """
         input url
         ouput one url code in url class
         """
-        added = []
-        if add_bos:
-            added.append(self.bos_token_id)
-        if tokens[0] != self.unk_token_id:
-            k = random.sample(tuple(self.sample_dict), 1)[0]
-            return added + random.sample(self.sample_dict[k], 1)[0]
-        return added + random.sample(self.sample_dict[tokens[0]], 1)[0]
+        try:
+            added = []
+            if add_bos:
+                added.append(self.bos_token_id)
+            if tokens[1] == self.unk_token_id:
+                k = random.sample(tuple(self.sample_dict), 1)[0]
+                v_i = random.sample(self.sample_dict[k], 1)[0]
+            else:
+                k = tokens[1]
+                v_i = random.sample(self.sample_dict[k], 1)[0]
+            return added + v_i
+        except Exception as err:
+            print('xxxxxxxxx', err)
+        return [0] * 4
 
     def decode(self, ids: Union[List[int], torch.LongTensor]) -> List[str]:
         """

@@ -145,7 +145,16 @@ class PtDataset(IterableDataset):
         for x in buffer:
             yield x
 
+    def parse_line(self, line):
+        def filter_seq(a, b):
+            res = set(a.split('|'))
+            return '|'.join([x for x in b.split('|') if x not in res])
+        secs = line.strip().split(',')
+        secs[43] = filter_seq(secs[90], secs[43])
+        return ','.join(secs)
+
     def check_line(self, line):
+
         flag = False
         secs = line.strip().split(',')
         ## 10w sample
@@ -215,6 +224,7 @@ class PtDataset(IterableDataset):
             # lines = (line.strip() for line in f if line.strip())
             try:
                 lines = (line.strip() for line in f if self.check_line(line))
+                # lines = (self.parse_line(line.strip()) for line in f if self.check_line(line))
                 if self.inter_file_shuffle and self.shuffle_buffer_size > 0:
                     lines = self._shuffle_buffer_iterator(lines)
                 while batch := list(islice(lines, self.batch_size)):

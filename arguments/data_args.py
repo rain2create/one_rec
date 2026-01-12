@@ -15,7 +15,7 @@ class DataArguments:
     # tokenizer
     codebook_layers: int = 3
     codebook_size: int = 1500
-    remote_mapping_file : str = '/data01/search/lusitong/dev/onerec_tokenizor_sort/data/clustering_results'
+    remote_mapping_file : str = '/mnt_onerec_model/jobs/onerec_tokenizor_sort/data/clustering_results'
     mapping_file: str = '../data/url_mapping'
     bos_token_id : int = 0
     unk_token_id : int = 1501
@@ -23,7 +23,7 @@ class DataArguments:
 
     # dataset
     #root_dir: str ="/mnt/video.rank.s101"
-    root_dir: str ="/mnt/video.rank.s101.pos_neg_test"
+    root_dir: str ="/mnt_onerec_model/corpus/video.rank.s101.pos_neg"
     corpus_days: int = 2
     with_today: bool = False
     batch_size: int = 1024
@@ -32,7 +32,7 @@ class DataArguments:
     compress_type: str = "gzip"
     done_spec: str = "onerec_sft_lazy_decoder_256_new_id"
     file_shuffle: bool = False
-    num_workers: int = 20
+    num_workers: int = 16
     test_root_dirs: str = ""
     val_root_dirs: str = ""
     inter_file_shuffle = True

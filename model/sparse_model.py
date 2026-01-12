@@ -32,17 +32,18 @@ class SparseModel(nn.Module):
                 for name, vocab_size in feature_vocabs.items()
             }
         )
-        
-        # self.user_features = ['uid', 'sign', 'autok', 'autoplay', 'reqtimes']
+
+        self.code_books_embeddings = nn.ModuleList(
+            [nn.Embedding(1502, self.emb_dim, sparse=True) for i in range(3)]
+        )
+
         self.user_features = ['sign', 'autok', 'autoplay', 'reqtimes']
-        self.logsess_features = ['md5', 'qid', 'videotag', 'timegap', 'duration', 'dwell', 'label']
+        self.logsess_features = ['lmcode', 'qid', 'videotag', 'timegap', 'duration', 'dwell', 'label']
         self.logqueue_features = self.logsess_features
-        self.logreallike_features = ['md5', 'qid', 'videotag', 'duration']
+        self.logreallike_features = ['lmcode', 'qid', 'videotag', 'duration']
 
     def _get_embedding(self, name: str, x: torch.Tensor) -> torch.Tensor:
         # 用 if-elif 静态分支，TorchScript 能编译
-        #if name == "uid":
-        #    return self.feature_embeddings["uid"](x)
         if name == "sign":
             return self.feature_embeddings["sign"](x)
         elif name == "autok":
@@ -51,8 +52,11 @@ class SparseModel(nn.Module):
             return self.feature_embeddings["autoplay"](x)
         elif name == "reqtimes":
             return self.feature_embeddings["reqtimes"](x)
-        elif name == "md5":
-            return self.feature_embeddings["md5"](x)
+        elif name == "lmcode":
+            a = self.code_books_embeddings[0](x[..., 0])
+            b = self.code_books_embeddings[1](x[..., 1])
+            c = self.code_books_embeddings[2](x[..., 2])
+            return torch.concat([a, b, c], -1)
         elif name == "qid":
             return self.feature_embeddings["qid"](x)
         elif name == "videotag":

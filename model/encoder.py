@@ -70,7 +70,8 @@ class Encoder(nn.Module):
         )
 
         # 位置编码 
-        self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, model_dim))
+        # self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, model_dim))
+        self.pos_embedding = nn.Parameter(torch.empty(1, max_seq_len, model_dim).uniform_(-0.02, 0.02))
 
         # 输出归一化
         self.norm = nn.LayerNorm(self.model_dim)

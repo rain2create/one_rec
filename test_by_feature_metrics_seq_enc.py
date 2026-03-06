@@ -47,7 +47,7 @@ url_tokenizer = UrlTokenizer.from_args(data_args)
 # load_data
 pt_parser = PtParser(data_args.columns_def, tokenizer=url_tokenizer) 
 pt_dataset = PtDataset(".", pt_parser.parser, 0, batch_size = 1, 
-    test_root_dirs = "/mnt_onerec_model/corpus/video.rank.s101.pos_neg_test/20251113/2025111316/")
+    test_root_dirs = "/mnt_onerec_model/corpus/video.rank.s101.pos_neg_test/20260118/2026011816/")
 dataloader = DataLoader(pt_dataset, batch_size=None, num_workers=1, pin_memory=True)
 
 # 加载 TorchScript 模型

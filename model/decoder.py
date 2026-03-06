@@ -19,6 +19,14 @@ from utils.logger import logger
 from utils.metrics import MeanMetric
 
 
+### 这里是真正实现了decoder的过程，采用前面decoder_moe的模块
+### 最后的输出 有对应的  output_logits (B,3,V) 表达每层码本对应的所有vob的logit概率
+##  还有loss = 对比学习loss+强化学习loss(PPO/GRPO)+aux_loss 
+##  还有probs  对应正确label的概率，response级别的 （B）
+## 这里是SFT+RL一次训到位
+
+
+
 class Decoder(nn.Module):
     """
     生成target item 的 semantic id
@@ -54,13 +62,18 @@ class Decoder(nn.Module):
         self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.ignore_idx, reduction='none')
         # self.loss_fn = nn.CrossEntropyLoss(ignore_index=self.ignore_idx)
 
-        # embeddings为nn.ModuleList，序列中每个位置使用不同的embedding layer
+        # decoder输入用的是自己的码本，decoder输出层和decoder输入层共享emb
+        ## 典型的 encoder–decoder（seq2seq）模型，通常会有两套 token embedding： 一套给 encoder 的输入，一套给 decoder 的输入！！！！
+        ## 因为encoder处理的是上下文，源序列；decoder处理的是 目标序列 要生成的内容
+        ## eg.机器翻译 Encoder：English embedding  Decoder：Chinese embedding；肯定俩套emb 不能共用
+        ## 在这里的解释是，码本输入的序列为用户历史序列物品，但这里我们输出的 希望是新的物品 并且用户感兴趣，词向量空间也不一样
+
         self.embeddings = nn.ModuleList([
             nn.Embedding(num_embeddings=self.codebook_size+2, embedding_dim=self.model_dim)
-            for i in range(self.codebook_layers+1)
-        ])
+            for i in range(self.codebook_layers+1)  ## 这里有四层码本 因为是 EOS/BOS（序列结束符号)需要额外一层 
+        ])                                          ## 同时这里码本size+2一个是要包含BOS类符号，一个是要包含ignore_idx，所以整体size加2
 
-        # 用来保证预估时候选在码本中
+        # 用来保证预估时候选在码本中  -- 后面会有对应提示
         self.ensure_matrix = nn.Parameter(torch.zeros(self.codebook_layers-1, self.codebook_size+2, self.codebook_size+2), requires_grad=False)
 
         """
@@ -75,7 +88,7 @@ class Decoder(nn.Module):
         )
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=self.layer_num)
         """
-
+        ## 一层正常的decoder layer
         decoder_layer = DecoderLayerMOE(
             num_experts=24,
             top_k=2,
@@ -88,15 +101,21 @@ class Decoder(nn.Module):
             norm_first=self.pre_norm,
             enable_moe=True,
         )
+
+        ## 多层decoder_layer组成的
         self.transformer_decoder = DecoderMOE(decoder_layer, num_layers=self.layer_num, d_model=self.model_dim)
 
-        # output_layer为nn.ModuleList，每个位置一个Linear，权重与对应的embeddings共享
+        # output_layer为nn.ModuleList，每个位置一个Linear，权重与对应的embeddings共享 一共三层layer，因为预测是跟输入错位
         self.output_layers = nn.ModuleList([
-            nn.Linear(self.model_dim, self.codebook_size+2, bias=False) for _ in range(self.codebook_layers)
+            nn.Linear(self.model_dim, self.codebook_size+2, bias=False) for _ in range(self.codebook_layers) 
         ])
+
+        ## 让输入层权重 = 输出层权重  注意错位相等！！
+        ## 权重绑定，表示当前输入层的emb就等于输入层+1的emb，节省计算量 也方便做loss （后续有）
+        ## 这里反向传播的时候梯度也会累加
         if self.weight_tying:
             for i in range(self.codebook_layers):
-                self.output_layers[i].weight = self.embeddings[i+1].weight
+                self.output_layers[i].weight = self.embeddings[i+1].weight  
 
         if not torch.jit.is_scripting():
             self.loss_rl = MeanMetric()
@@ -105,6 +124,7 @@ class Decoder(nn.Module):
             self.neg_pi_new = MeanMetric()
             self.cts_pi_new = MeanMetric()
 
+    ## 这个函数没有用！！！
     def _load_ensure_matrix(self, path: str):
         mat = np.load(path)
         tensor = torch.from_numpy(mat).float()
@@ -116,11 +136,15 @@ class Decoder(nn.Module):
                 self.ensure_matrix.copy_(tensor)
                 print('矩阵已加载并赋值: {}'.format(path))
 
-    def _generate_square_subsequent_mask(self, sz: int):
+
+     ## 这里是在做上三角矩阵mask！！！
+    def _generate_square_subsequent_mask(self, sz: int): 
         """Generate a square subsequent mask (upper triangular -inf)."""
         mask = torch.triu(torch.full((sz, sz), float('-inf')), diagonal=1)
         return mask
 
+    ## 本质就为decoder的整个过程
+    ## encoder_output和decoder的input ids  经过decoder和output_layer后 每一层layer对应vob词表的 logit！！！ shape [B, slen, V]
     def _compute_output_logits(self, encoder_output: torch.Tensor, encoder_mask: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """
         TorchScript 兼容版本，不使用 ModuleList 动态索引
@@ -131,28 +155,37 @@ class Decoder(nn.Module):
         Returns:
             output_logits: [B, seq_dec, V]
         """
-        B, slen = input_ids.size()
-        D = self.model_dim
-        V = self.output_layers[0].weight.size(0)
-        # 1. tgt mask
-        tgt_mask_ = self._generate_square_subsequent_mask(slen).to(input_ids.device)
-        # 2. 获取 embeddings 权重堆叠成 Tensor: [L, V, D]
-        emb_weights = torch.stack([emb.weight for emb in self.embeddings])  # [max_len, V_emb, D]
+        B, slen = input_ids.size()  ## slen是序列长度，比如3；
+        D = self.model_dim  ## 拿到model_dim
+        V = self.output_layers[0].weight.size(0)  ## 拿到 1502词表大小
+        
+        # 1. tgt mask 拿到上三角矩阵
+        tgt_mask_ = self._generate_square_subsequent_mask(slen).to(input_ids.device) 
+        
+        # 2. 获取 embeddings 权重堆叠成 Tensor: [L, V, D]   形状 [4, V, D]  一共有四层 但只用到三层emb
+        emb_weights = torch.stack([emb.weight for emb in self.embeddings])  
+
+        ## (B,3,D) slen = 3
+        ## 给每个token 赋值对应的emb
         input_embs = torch.empty(B, slen, D, device=input_ids.device)
+        ## 这里是做decoder input的emb
         for i in range(slen):
-            input_embs[:, i, :] = F.embedding(input_ids[:, i], emb_weights[i])
+            input_embs[:, i, :] = F.embedding(input_ids[:, i], emb_weights[i])  ## 每一层layer 对应一层weight 只用到三层
+        
         # 3. transformer decoder forward
         decoder_out = self.transformer_decoder(
             input_embs, encoder_output, tgt_mask=tgt_mask_, memory_key_padding_mask=encoder_mask
-        )  # [B, slen, D]
-        # 4. 输出层权重堆叠成 Tensor: [L, V, D]
-        out_weights = torch.stack([layer.weight for layer in self.output_layers])  # [max_len, V, D]
-        # 5. 逐步计算 logits
+        )  # [B, 3, D]  由DecoderMOE 组成  
+        
+        # 4. 输出层权重堆叠成 Tensor: [3, V, D]，也是只有三层
+        out_weights = torch.stack([layer.weight for layer in self.output_layers])  # [3, V, D]
+        
+        # 5. 逐步计算 logits  做线性转换
         output_list = []
-        for i in range(slen):
-            emb = F.normalize(decoder_out[:, i, :], dim=-1)               # [B, D]
-            weight = F.normalize(out_weights[i], dim=-1).transpose(0, 1)  # [D, V]
-            cur_l_logit = torch.matmul(emb, weight) * self.temperature    # [B, V]
+        for i in range(slen): ## slen = 3
+            emb = F.normalize(decoder_out[:, i, :], dim=-1)               # [B, D]  做标准化
+            weight = F.normalize(out_weights[i], dim=-1).transpose(0, 1)  # [D, V]  标准化
+            cur_l_logit = torch.matmul(emb, weight) * self.temperature    # [B, V]  线性转换 
             output_list.append(cur_l_logit)
         output_logits = torch.stack(output_list, dim=1)  # [B, slen, V]
         return output_logits
@@ -189,7 +222,9 @@ class Decoder(nn.Module):
             output_list.append(cur_l_logit)
         output_logits = torch.stack(output_list, dim=1)  # [B, slen, V]
         return output_logits
+    
 
+    ## 利用转移码本，之前训练集出现过的才有效 否则无效
     def _compute_output_logits_mask_his(self, encoder_output: torch.Tensor, encoder_mask: torch.Tensor, input_ids: torch.Tensor, his_ids: torch.Tensor) -> torch.Tensor:
         """
         _compute_output_logits的mask版本，通过mask logit提升反解率, 只在生成阶段使用。
@@ -197,13 +232,18 @@ class Decoder(nn.Module):
         B, slen = input_ids.size()
         D = self.model_dim
         V = self.output_layers[0].weight.size(0)
-        # 1. tgt mask
+        ## 获取基础维度信息。
+
+        # 1. tgt mask 生成上三角mask
         tgt_mask_ = self._generate_square_subsequent_mask(slen).to(input_ids.device)
-        # 2. 获取 embeddings 权重堆叠成 Tensor: [L, V, D]
+
+        # 2. 获取 embeddings 权重堆叠成 Tensor: [L, V, D]  
         emb_weights = torch.stack([emb.weight for emb in self.embeddings])  # [max_len, V_emb, D]
         input_embs = torch.empty(B, slen, D, device=input_ids.device)
         for i in range(slen):
-            input_embs[:, i, :] = F.embedding(input_ids[:, i], emb_weights[i])
+            input_embs[:, i, :] = F.embedding(input_ids[:, i], emb_weights[i])  
+        ## 为每个位置找对应的embedding
+
         # 3. transformer decoder forward
         decoder_out = self.transformer_decoder(
             input_embs, encoder_output, tgt_mask=tgt_mask_, memory_key_padding_mask=encoder_mask
@@ -313,17 +353,18 @@ class Decoder(nn.Module):
         ent = -(probs * logp).sum(dim=-1)  # [B]
         return ent.mean()  # scalar
 
-    def rl_loss(self, features: Dict[str, torch.Tensor], pi_new: torch.Tensor):
+    def rl_loss(self, features: Dict[str, torch.Tensor], pi_new: torch.Tensor):  ## 这是什么算法
         # pi_safe = torch.where(
         #     features['advantages'] >= 0.0, 
         #     torch.maximum(features['pi_old'], pi_new),
         #     torch.maximum(features['pi_old'], 1.0 - pi_new)
         # )
 
-        pi_safe = torch.where(features['advantages'] > 0.0, pi_new, 1.0 - pi_new)
-        # pi_safe = torch.where(features['advantages'] > 0.0, pi_new, pi_new)
+        # pi_safe = torch.where(features['advantages'] > 0.0, pi_new, 1.0 - pi_new)
+        pi_safe = torch.where(features['advantages'] > 0.0, pi_new, pi_new)
+        ## pi_safe = pi_new
 
-        ratio = pi_new / pi_safe.detach()
+        ratio = pi_new / pi_safe.detach()  #ratio比例  这里detach 是为了梯度回传有缩放，帮助放大梯度
 
         # bound = pi_new / features['pi_old']
         # ratio = torch.where((bound.detach() < 0.8) & (features['advantages'] < 0.0), 0.0, ratio)
@@ -339,10 +380,10 @@ class Decoder(nn.Module):
         #         'rat', ratio[-3:]
         # )
 
-        mask = (features['advantages'] != 0.0)
-        loss = -(ratio * features['advantages'])
+        mask = (features['advantages'] != 0.0) ## 拿有效的样本
+        loss = -(ratio * features['advantages'])  
 
-        loss = (loss * mask).sum() / (mask.sum().clamp_min(1))
+        loss = (loss * mask).sum() / (mask.sum().clamp_min(1))  ##做标准化
 
         pos_pi_new = torch.where(features['advantages']  > 0, pi_new, 0.0).sum() / ((features['advantages']  > 0).sum() + 1)
         neg_pi_new = torch.where(features['advantages']  < 0, pi_new, 0.0).sum() / ((features['advantages']  < 0).sum() + 1)
@@ -366,10 +407,12 @@ class Decoder(nn.Module):
         # shape: [batch_size, 4]
         url_ids = features["url"]
         seqs_len = url_ids.shape[1]
-        output_logits = self._compute_output_logits(encoder_output, encoder_mask, url_ids[:, 0 : -1])  #[batch, codebook_layers, V]
+        
+        ## 过decoder 算vob的logits，但不要最后一个id
+        output_logits = self._compute_output_logits(encoder_output, encoder_mask, url_ids[:, 0 : -1])  #[batch, 3, V]
 
-        labels = url_ids[:, 1:]
-        batch_size, seq_len_minus1, vocab_size = output_logits.shape
+        labels = url_ids[:, 1:]  ## 拿label
+        batch_size, seq_len_minus1, vocab_size = output_logits.shape  ## 标shape
 
         output_logits = output_logits.reshape(-1, vocab_size)
         labels = labels.reshape(-1)
@@ -378,10 +421,12 @@ class Decoder(nn.Module):
         mask = features["mask"]
         mask_expanded = mask.unsqueeze(1).expand(-1, seqs_len-1).reshape(-1).to(torch.bool)
         masked_labels = labels.clone()
-        masked_labels[~mask_expanded] = self.ignore_idx # 设置无效位置忽略
+        masked_labels[~mask_expanded] = self.ignore_idx # 设置无效位置忽略，只看有效的label
 
         if (masked_labels != self.ignore_idx).any():
-            loss = self.loss_fn(output_logits, masked_labels)
+            loss = self.loss_fn(output_logits, masked_labels)  ## 交叉熵求loss，这里为本身原始预测loss  -log(p)
+        
+        ## 下面为强化学习loss
 
             # v1 对比 + 权重融合
             # # handle neg loss
@@ -394,12 +439,12 @@ class Decoder(nn.Module):
             # loss = (loss * torch.abs(w)).mean()
 
             if not torch.jit.is_scripting():
-                # v2, 只有对比的部分, adv>0: log_softmax, adv=0: 1-, adv<0: 0 (loss在强化部分)
-                loss_neg = - torch.log(1e-6 + 1.0 - torch.exp(loss * -1.0))
+                # v2, 只有对比的部分, adv>0: log_softmax, adv=0: 1-, adv<0: 0 (loss在强化部分) ！！！
+                loss_neg = - torch.log(1e-6 + 1.0 - torch.exp(loss * -1.0))  ## 负样本的loss  -log(1-p)
                 s = features['advantages'].repeat_interleave(3, dim=0)
                 loss_neg = torch.where(s < 0.0, 0.0, loss_neg)
-                loss = torch.where(s > 0.0, loss, loss_neg).sum() / torch.sum(s >= 0).clamp_min(1)
-                self.loss_ct(loss)
+                loss = torch.where(s > 0.0, loss, loss_neg).sum() / torch.sum(s >= 0).clamp_min(1)  ## 这里只处理正负样本做对比学习
+                self.loss_ct(loss) ##单纯求mean
 
             ## balance_loss for new urls
             #if not torch.jit.is_scripting():
@@ -418,10 +463,10 @@ class Decoder(nn.Module):
             if not torch.jit.is_scripting():
                 probs_ = F.log_softmax(output_logits.view(batch_size, seq_len_minus1, vocab_size), -1)
                 labels_ = labels.view(batch_size, seq_len_minus1)
-                probs_ = torch.exp(torch.gather(probs_, dim=2, index=labels_.unsqueeze(-1)).squeeze(-1).sum(dim=-1))
+                probs_ = torch.exp(torch.gather(probs_, dim=2, index=labels_.unsqueeze(-1)).squeeze(-1).sum(dim=-1))  ## response level
                 rl_loss = self.rl_loss(features, probs_)
-                loss = loss + rl_loss
-                self.loss_rl(rl_loss)
+                loss = loss + rl_loss  ## 整体的loss就为对比学习+强化学习+auxloss
+                self.loss_rl(rl_loss) ## 强化学习的loss
         else:
             # 返回0损失，保持梯度流通
             loss = (output_logits * 0.0).mean()
@@ -430,7 +475,7 @@ class Decoder(nn.Module):
         labels = labels.view(batch_size, seq_len_minus1)
         log_probs = F.log_softmax(output_logits, dim=-1)
         # [batch_size]
-        probs = torch.exp(torch.gather(log_probs, dim=2, index=labels.unsqueeze(-1)).squeeze(-1).sum(dim=-1))
+        probs = torch.exp(torch.gather(log_probs, dim=2, index=labels.unsqueeze(-1)).squeeze(-1).sum(dim=-1)) ## 取对应label的logit
 
         # valid prob 
         mask_valid = mask.sum()
@@ -539,26 +584,36 @@ class Decoder(nn.Module):
                        his_code: torch.Tensor, group_num: int = 5) -> Dict[str, torch.Tensor]:
         B = encoder_output.size(0)
         device = encoder_output.device
-        new_B = B * group_num
+        new_B = B * group_num  ## 代表生成的候选结果，类似一条用户特征 生成5个候选，这里是所有的候选
 
         # 只缓存 token ids，不缓存 embeddings
-        input_ids = torch.full((new_B, 1), self.bos_token_id, dtype=torch.long, device=device)
+        input_ids = torch.full((new_B, 1), self.bos_token_id, dtype=torch.long, device=device) 
+        # 初始化输入：每个候选都是 [BOS]，形状 [B*group_num, 1]
+
         logprobs = torch.full((new_B, 1), 0., dtype=torch.float32, device=device)
+        # 初始化 log 概率：起始为 0，形状 [B*group_num, 1]
+
         scores = torch.zeros(new_B, device=device)
+        # 初始化累计分数：用于 Beam Search 排序，形状 [B*group_num]
+
 
         # repeat encoder_output & mask by group_size
         encoder_output = encoder_output.repeat_interleave(group_num, dim=0)
         encoder_mask = encoder_mask.repeat_interleave(group_num, dim=0)
+        # 扩展 encoder 输出，每个用户复制 group_num 份
+
      
         for step in range(self.codebook_layers):
-            # 1. 计算对应位置的预测logits
-            output_logits = self._compute_output_logits_mask_his(encoder_output, encoder_mask, input_ids, his_code)     #[batch, curlen, V]
-            last_logits = output_logits[:, -1, :]       # [new_b, V]
+            # 1. 计算对应位置的预测logits  这里利用了码本转移的特性
+            output_logits = self._compute_output_logits_mask_his(encoder_output, encoder_mask, input_ids, his_code)  #[new_B, curlen, V]
+            last_logits = output_logits[:, -1, :]    # [new_b, V]  只拿最后一个位置的logit  因为这是推理
             # 温度缩放，解决前两级别锁死的问题
             # last_logits = last_logits / last_logits.std()
-            # 2. 扩展候选
-            log_probs_step = F.log_softmax(last_logits, dim=-1)
-            topk_log_probs, topk_tokens = torch.topk(log_probs_step, group_num, dim=-1)  # [new_B, group_num]
+            
+            # 2. 根据最后一个logit 扩展候选
+            log_probs_step = F.log_softmax(last_logits, dim=-1)  # log 概率，形状 [new_B, V]
+            topk_log_probs, topk_tokens = torch.topk(log_probs_step, group_num, dim=-1)  # 选 top-group_num 个候选，形状都是 [new_B, group_num]
+            
             # 3. 计算新分数,累计log_probs
             current_scores = scores.view(B, group_num)
             new_scores = current_scores.unsqueeze(2) + topk_log_probs.view(B, group_num, group_num)
@@ -594,7 +649,20 @@ class Decoder(nn.Module):
             "output_logprobs": log_probs
         }
 
-   
+## 以上流程，就是为推理生成多个候选
+# 初始化: 每用户5个[BOS]候选
+#     ↓
+# Step 1: 预测code1 → 每候选top5 → 25组合 → 选top5 → 追加code1
+#     ↓
+# Step 2: 预测code2 → 每候选top5 → 25组合 → 选top5 → 追加code2  
+#     ↓
+# Step 3: 预测code3 → 每候选top5 → 25组合 → 选top5 → 追加code3
+#     ↓
+# 输出: [code1, code2, code3] × 5个候选/用户  形状 [B*group_num, 3]
+
+
+
+
 
 if __name__ == "__main__":
     from torch.utils.data import DataLoader

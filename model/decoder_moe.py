@@ -16,7 +16,13 @@ import torch.nn.functional as F
 from torch.nn import TransformerDecoderLayer, TransformerDecoder
 
 
-def _generate_square_subsequent_mask(
+### 这里是decoder_moe模块的实现！！！ 包含decoder_moe layer和decoder_moe
+### decoder_moe layer 包含x过 layernorm + causal attention + layernorm + cross attention + layernorm + moe/mlp
+### decoder_moe 就是多层decoder_moe layer组成的decoder
+
+
+
+def _generate_square_subsequent_mask(  ## 上三角矩阵的mask ！！！
     sz: int,
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
@@ -25,12 +31,12 @@ def _generate_square_subsequent_mask(
 
     The masked positions are filled with float('-inf'). Unmasked positions are filled with float(0.0).
     """
-    return torch.triu(
-        torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),
-        diagonal=1,
+    return torch.triu(  ## 只保留上三角区域，其他位置为0
+        torch.full((sz, sz), float("-inf"), dtype=dtype, device=device),  ## 这里full是生成shape 为（sz,sz)的矩阵，元素都一样为 -inf
+        diagonal=1, ## 代表主对角线以上
     )
 
-def _get_seq_len(src: Tensor, batch_first: bool) -> Optional[int]:
+def _get_seq_len(src: Tensor, batch_first: bool) -> Optional[int]:  ## 取数据集里的序列长度！！！
     if src.is_nested:
         return None
     else:
@@ -44,7 +50,7 @@ def _get_seq_len(src: Tensor, batch_first: bool) -> Optional[int]:
             return src_size[seq_len_pos]
 
 
-def _detect_is_causal_mask(
+def _detect_is_causal_mask( ## 检查万一没传is_causal还有mask的情况，检查这个mask是不是上三角矩阵 最后看情况返回true或者false
     mask: Optional[Tensor],
     is_causal: Optional[bool] = None,
     size: Optional[int] = None,
@@ -53,22 +59,22 @@ def _detect_is_causal_mask(
     make_causal = is_causal is True
 
     if is_causal is None and mask is not None:
-        sz = size if size is not None else mask.size(-2)
+        sz = size if size is not None else mask.size(-2)  ## 拿seq长度
         causal_comparison = _generate_square_subsequent_mask(
             sz, device=mask.device, dtype=mask.dtype
-        )
+        ) ## 生成上三角的mask
 
         # Do not use `torch.equal` so we handle batched masks by
         # broadcasting the comparison.
         if mask.size() == causal_comparison.size():
-            make_causal = bool((mask == causal_comparison).all())
+            make_causal = bool((mask == causal_comparison).all()) ## 确认是不是casual mask
         else:
             make_causal = False
 
-    return make_causal
+    return make_causal  ##最终返回的是True或者False
 
 
-class DecoderLayerMOE(TransformerDecoderLayer):
+class DecoderLayerMOE(TransformerDecoderLayer):  ## 这个layer就是 x进来之后 先过self-attention, 再过cross-attention,再过MOE 再过ffn ！！！！ 正常的decoder_moe结构结构
 
     def __init__(
         self,
@@ -106,7 +112,7 @@ class DecoderLayerMOE(TransformerDecoderLayer):
             dropout_p=0.1,
             is_causal=is_causal
         )
-        return self.dropout2(self.out_proj(out))
+        return self.dropout2(self.out_proj(out))   ## 这里是做flash_attention 但用的是别人的kv 相当于cross attention!!! 用之前的kv cache
 
     '''
     def _mha_block(self, x: Tensor, mem: Tensor, attn_mask: Optional[Tensor], key_padding_mask: Optional[Tensor], is_causal: bool = False):
@@ -175,10 +181,10 @@ class DecoderLayerMOE(TransformerDecoderLayer):
 
         x = tgt
         if self.norm_first:
-            x = x + self._sa_block(
+            x = x + self._sa_block(  ## sa_block是标准attention 有mask
                 self.norm1(x), tgt_mask, tgt_key_padding_mask, tgt_is_causal
             )
-            x = x + self._mha_block(
+            x = x + self._mha_block(  ## 这里是做cross_attention
                 self.norm2(x),
                 shared_k,
                 shared_v,
@@ -186,11 +192,11 @@ class DecoderLayerMOE(TransformerDecoderLayer):
                 memory_key_padding_mask,
                 memory_is_causal,
             )
-            if self.enable_moe:
+            if self.enable_moe:  ## 如果enable_moe为True，则过moe 否则过mlp
                 x_ = self.moe(self.norm3(x))
                 x = x + x_
             else:
-                x = x + self._ff_block(self.norm3(x))
+                x = x + self._ff_block(self.norm3(x))  ## ff block就是普通的mlp
         else:
             x = self.norm1(
                 x + self._sa_block(x, tgt_mask, tgt_key_padding_mask, tgt_is_causal)
@@ -215,7 +221,7 @@ class DecoderLayerMOE(TransformerDecoderLayer):
         return x
 
 
-class SharedMemoryKV(nn.Module):
+class SharedMemoryKV(nn.Module): ## kv cache
     """
     Project memory to shared K / V (used by all decoder layers)
     """
@@ -234,7 +240,7 @@ class SharedMemoryKV(nn.Module):
         return k, v
 
 
-class DecoderMOE(TransformerDecoder):
+class DecoderMOE(TransformerDecoder):## 有多层decoder_moe layer组成的decoder
 
     def __init__(
         self,
@@ -260,12 +266,12 @@ class DecoderMOE(TransformerDecoder):
 
         output = tgt
 
-        seq_len = _get_seq_len(tgt, self.layers[0].self_attn.batch_first)
-        tgt_is_causal = _detect_is_causal_mask(tgt_mask, tgt_is_causal, seq_len)
+        seq_len = _get_seq_len(tgt, self.layers[0].self_attn.batch_first)  ## 取数据集序列长度
+        tgt_is_causal = _detect_is_causal_mask(tgt_mask, tgt_is_causal, seq_len)  ## 检查是否为上三角mask
 
-        shared_k, shared_v = self.shared_kv_layer(memory)
+        shared_k, shared_v = self.shared_kv_layer(memory)  ## encoder里的kv
 
-        for mod in self.layers:
+        for mod in self.layers:  ## 这里的 mod 就是单个 DecoderLayerMOE 实例（即一个 Decoder 层）
             output = mod(
                 output,
                 shared_k,

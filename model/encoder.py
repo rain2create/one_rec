@@ -12,6 +12,16 @@ import torch.nn as nn
 from typing import Dict, List, Tuple, Optional, Union
 from utils.logger import logger
 
+
+
+### 这里是做encoder编码，返回转换后的特征以及mask_padding矩阵 ！！！！
+### 前提：这里三个用户序列级别特征都是存了30个，加上用户本身特征1个，所以一个x 有seq长度为91
+### 这里的encoder 单就是由一层mlp+layer_norm组成；四类特征过mlp都转为model_dim,然后cat在一起(seq维度)然后加上位置编码 过layer_norm层
+### 最后返回encoder结果 shape(batch_size,91,model_dim) + 对应的mask_padding矩阵 (batch_size,91)
+
+
+
+
 class Encoder(nn.Module):
     """
     使用Transformer对用户序列特征进行编码，输出embedding
@@ -41,42 +51,46 @@ class Encoder(nn.Module):
         self.logqueue_features = self.logsess_features
         self.logreallike_features = ['md5', 'qid', 'videotag', 'duration']
 
-        # dense(leakyrelu(dense))
+
+        ## 最后不管多少dim所有都转为emb_dim！！！！！
+
+
+         # dense(leakyrelu(dense))
         self.user_proj = nn.Sequential(
             nn.Linear(len(self.user_features) * self.emb_dim, self.model_dim),
             nn.LeakyReLU(),
             nn.Linear(self.model_dim, self.model_dim)
-        )
+        )  ## user特征的mlp
 
         # dense(leakyrelu(dense))
         self.logsess_proj = nn.Sequential(
             nn.Linear(len(self.logsess_features) * self.emb_dim + self.emb_dim * 2, self.model_dim),
             nn.LeakyReLU(),
             nn.Linear(self.model_dim, self.model_dim)
-        )
+        )  ## logsess特征的mlp
 
         # dense(leakyrelu(dense))
         self.logqueue_proj = nn.Sequential(
             nn.Linear(len(self.logqueue_features) * self.emb_dim + self.emb_dim * 2, self.model_dim),
             nn.LeakyReLU(),
             nn.Linear(self.model_dim, self.model_dim)
-        )
+        ) ## logsess特征的mlp
 
         # dense(leakyrelu(dense))
         self.logreallike_proj = nn.Sequential(
             nn.Linear(len(self.logreallike_features) * self.emb_dim + self.emb_dim * 2, self.model_dim),
             nn.LeakyReLU(),
             nn.Linear(self.model_dim, self.model_dim)
-        )
+        ) ## logreallike特征的mlp
 
         # 位置编码 
-        # self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, model_dim))
-        self.pos_embedding = nn.Parameter(torch.empty(1, max_seq_len, model_dim).uniform_(-0.02, 0.02))
+        # self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, model_dim))   max_seq_len = 128 最大的序列长度 做初始化
+        self.pos_embedding = nn.Parameter(torch.empty(1, max_seq_len, model_dim).uniform_(-0.02, 0.02)) 
 
         # 输出归一化
         self.norm = nn.LayerNorm(self.model_dim)
 
-    def _get_mask(self, features: Dict[str, torch.Tensor]):
+    def _get_mask(self, features: Dict[str, torch.Tensor]):  ## 这里主要在拿padding的mask
         """
         Args:
             features: Dict[str, torch.Tensor]
@@ -88,7 +102,9 @@ class Encoder(nn.Module):
         # 获取logqueue_features的mask
         logqueue_mask = features['logque_mask']
         # 获取logreallike_features的mask
-        logreallike_mask = features['logreallike_mask']
+        logreallike_mask = features['logreallike_mask']  
+
+        ## shape (batch_size, 1 + 30 + 30 + 30)  这里一共91表示的是序列长度
         masks = torch.cat([torch.ones(logsess_mask.size(0), 1, device=logsess_mask.device), logsess_mask, logqueue_mask, logreallike_mask], dim=1)
         return masks
 
@@ -99,22 +115,24 @@ class Encoder(nn.Module):
         Returns:
             embedding: shape (batch_size, seq_len, embed_dim)
         """
+
+        ## 这里是之前sparse model算好的特征输入进来 即是拼接的特征！！！
         user_features, logsess_features, logqueue_features, logreallike_features = feature_embeddings
 
         # [batch_size, len(user_features) * model_dim]
         # [batch_size, model_dim] -> [batch_size, 1, model_dim]
         user_features = self.user_proj(user_features).unsqueeze(1)
 
-        # [batch_size, 30, len(logsess_features) * model_dim]
+        # [batch_size, 30, model_dim]  30表示logsess的序列长度 即历史行为数 ！！！
         logsess_features = self.logsess_proj(logsess_features)
 
-        # [batch_size, 30, len(logqueue_features) * model_dim]
+        # [batch_size, 30, model_dim]  同上！！！
         logqueue_features = self.logqueue_proj(logqueue_features)
 
-        # [batch_size, 30, len(logreallike_features) * model_dim]
+        # [batch_size, 30, model_dim]  同上！！！
         logreallike_features = self.logreallike_proj(logreallike_features)
 
-        # [batch_size, 1 + 30 + 30 + 30, model_dim]        
+        # [batch_size, 1 + 30 + 30 + 30, model_dim]    ## 一共序列长度为91
         inputs = torch.cat([user_features, logsess_features, logqueue_features, logreallike_features], dim=1)
         seq_len = inputs.size(1)
 
@@ -122,13 +140,13 @@ class Encoder(nn.Module):
             raise ValueError(f"输入序列长度 {seq_len} 超过最大支持长度 {self.max_seq_len}")
 
         # 加位置编码
-        pos_emb = self.pos_embedding[:, :seq_len, :]
+        pos_emb = self.pos_embedding[:, :seq_len, :]  ## 相当于一个x输入 一共有91个token 包含一个用户特征， 30*3的用户序列特征，所以一共91个位置编码，这里每个类别特征都算一个token
         inputs = inputs + pos_emb
 
         attn_mask = self._get_mask(features)
         # TransformerEncoder期望mask为True表示被mask（即pad），False为有效
         # [batch_size, 1 + 30 + 30 + 30]
-        attn_mask = ~attn_mask.to(torch.bool)
+        attn_mask = ~attn_mask.to(torch.bool)  ## 做padding mask 返回该矩阵
 
         # Transformer编码
         x = self.norm(inputs)

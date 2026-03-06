@@ -16,6 +16,12 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+
+### 这里包含MOE全过程  包含moe的辅助损失，以及路由选择，以及专家选择，最终输出 topk专家输出加权和！！！！ 
+### 也包含causal attention过程！！！！
+### 最后这些都能被包含在一个板块 block种
+### 最后总结就是 一个block为  x经过layernorm + 做casual attention +layernorm + moe/mlp ！！！！
+
 import math
 import inspect
 from dataclasses import dataclass
@@ -28,7 +34,7 @@ from torch.nn import functional as F
 
 MANAGER = MOEManager()
 
-class LayerNorm(nn.Module):
+class LayerNorm(nn.Module):  ## 做layernorm 
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
     def __init__(self, ndim, bias):
@@ -39,7 +45,7 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class CausalSelfAttention(nn.Module):
+class CausalSelfAttention(nn.Module):  ## 做casual attention  单纯就是attention过程！！！
 
     def __init__(self, config):
         super().__init__()
@@ -60,7 +66,7 @@ class CausalSelfAttention(nn.Module):
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))  ## 这里生成上三角矩阵！！！！
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -88,25 +94,27 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-class Router(nn.Module):
+class Router(nn.Module):  ## 路由 选topk的expert的过程-- 最后其实输出的就是对应的topk的权重以及所选的topk expert的矩阵!!!!
     def __init__(self, config):
         super().__init__()
 
         # router settings
         self.top_k = config.top_k
-        self.n_exp = config.n_exp
-        assert self.top_k >= 1 and self.top_k <= config.n_exp
+        self.n_exp = config.n_exp  ## 一共多少专家
+        assert self.top_k >= 1 and self.top_k <= config.n_exp  ## 确定topk要小于等于总专家数
+
+        ## 这里主要是为了负载均衡，标记每个expert最多能管几个token
         self.train_capacity = config.train_capacity
         self.eval_capacity = config.eval_capacity
         self.min_capacity = config.min_capacity
-        self.router_use_full_prec = config.router_use_full_prec
+        self.router_use_full_prec = config.router_use_full_prec ## 用fp32，数据更加有精细颗粒度
 
         # auxiliary / load balancing loss settings
         self.use_aux_loss = config.use_aux_loss
         self.use_router_z_loss = config.use_router_z_loss
 
         # no bias is used, see page 4 eq (4) in (https://arxiv.org/abs/1701.06538)
-        self.w_g = nn.Linear(config.n_embd, config.n_exp, bias=False)
+        self.w_g = nn.Linear(config.n_embd, config.n_exp, bias=False)  ## 转成专家数
 
     def forward(self, x):
         # optionally run the router in full precision to avoid instability during training
@@ -117,80 +125,62 @@ class Router(nn.Module):
         num_tokens = B * T
 
         # eq (4) in (https://arxiv.org/abs/1701.06538)
-        logits = self.w_g(x)  # [B, T, n_exp]
+        logits = self.w_g(x)  # [B, T, n_exp]  过线性层转成专家数！！！
 
         # find top k experts for each token
-        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1) # [B, T, k]
+        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1) # [B, T, k]  选topk的！！！ 拿对应分数 和 index
 
-        # normalize expert probabilities
-        # Question: should we normalize over all experts or just top-k?
-        # we choose to normalize over top-k, other option is commented out below
+        router_probs = torch.full_like(logits, float('-inf'))  # [B, T, n_exp]  这里full_like是先造一个全是 -∞ 的张量，形状和 logits 一模一样，然后填入topk_logits的值
+        router_probs.scatter_(-1, top_k_indices, top_k_logits)  ## 沿着 dim，把 top_k_logits 的值，填到 index 指定的位置上
+        router_probs = F.softmax(router_probs, dim=-1)  ## 最后来做softmax  shape是 [B, T, n_exp] 
 
-        # Shazeer et al (https://arxiv.org/abs/1701.06538) does only topk
-        # see page 4 eq (3)-(5), the code for this is commented out below
-        router_probs = torch.full_like(logits, float('-inf'))  # [B, T, n_exp]
-        router_probs.scatter_(-1, top_k_indices, top_k_logits)
-        router_probs = F.softmax(router_probs, dim=-1)
+        # 1. 直接softmax: 所有专家都会获得非零概率，包括那些不在top-k中的专家
+        # 2. 当前做法: 只有top-k位置的专家会获得非零概率，其他位置是-inf，softmax后变成0
+   
 
-        # # normalize all router logits (not just top-k) via softmax      
-        # router_probs = F.softmax(logits, dim=-1)
-
-        # compute auxiliary load balancing loss
-        # this loss encourages equal probability assigned to each expert
-        # and equal load balancing of tokens assigned to each expert
-
+        ## 是否使用aux_loss!!!
         if not torch.jit.is_scripting():
             if self.use_aux_loss:
-                aux_loss = self.compute_aux_loss(router_probs, top_k_indices)
+                aux_loss = self.compute_aux_loss(router_probs, top_k_indices) 
                 MANAGER.add_aux_loss(aux_loss)
 
-        # compute expert capacity
-        exp_capacity = self.get_capacity(num_tokens)
+        # compute expert capacity 拿每个专家的token数分配
+        exp_capacity = self.get_capacity(num_tokens)  ## 返回整数
 
-        # make a multi-hot mask of chosen experts, size [B, T, n_exp]
-        # entries are 0 if expert not chosen and 1 if expert chosen
+        ## one-hot编码 转成对应专家的mask
         exp_mask = F.one_hot(top_k_indices, num_classes=self.n_exp)  # [B, T, k, n_exp]
         exp_mask = exp_mask.view(num_tokens, self.top_k, self.n_exp)  # [B * T, k, n_exp]
-        exp_mask = exp_mask.permute(1, 0, 2) # [k, B * T, n_exp]
+        exp_mask = exp_mask.permute(1, 0, 2) # [k, B * T, n_exp] 转换位置  现在结构变成 第一个expert的选择.... 第二个expert的选择
 
-        # compute cumulative sum of each token over experts, this stores
-        # the index of each token within the batch of each expert
-        # NOTE: cumsum should count all top-1 first, top-2 second, etc.
-        # so that we prioritize top experts when dropping tokens (this is
-        # done by putting k dimension first for the reshape operation)
-        exp_rank = exp_mask.reshape(self.top_k * num_tokens, self.n_exp)  # [k * B * T, n_exp]
-        exp_rank = torch.cumsum(exp_rank, dim=0) - 1  # cumulative sum of expert selections [k * B * T, n_exp]
-        exp_rank = exp_rank.reshape(self.top_k, num_tokens, self.n_exp)  # [k, B * T, n_exp]
+        ## 计算每个token在每个expert内的rank
+        exp_rank = exp_mask.reshape(self.top_k * num_tokens, self.n_exp)  # [k * B * T, n_exp]  把整个序列拉长
+        exp_rank = torch.cumsum(exp_rank, dim=0) - 1  # 对每个topk expert的选择做累加 [k * B * T, n_exp]  exp_rank 表示：这个 token 是这个 expert 收到的第几个 token（slot id）
+        exp_rank = exp_rank.reshape(self.top_k, num_tokens, self.n_exp)  # [k, B * T, n_exp] 换view
 
-        # mask out (set to zero) entries that go beyond expert capacity
-        # compute amount of used capacity by taking a sum over mask
-        exp_mask *= torch.lt(exp_rank, exp_capacity) # [k, B * T, n_exp]
-        used_capacity = torch.sum(exp_mask, dim=(0, 1)) # [n_exp]
+        ## 容量裁剪（超出 capacity 的 token 直接踢掉） 
+        exp_mask *= torch.lt(exp_rank, exp_capacity) # [k, B * T, n_exp]  
+        ## 如果某个token在expert内的rank >= capacity，它的mask被置0，表示不分配给这个expert
 
-        # mask rank to only include tokens that are selected
-        # perform a sum so each row only contains index of token
-        # for the expert that is selected in that row
-        # result is a matrix that contains the position of each token
-        # in the batch of its corresponding expert
+        used_capacity = torch.sum(exp_mask, dim=(0, 1)) # [n_exp] 看每个expert 实际分配了多少token
+
+        ## 第一个选择 每个 token 在它被选中的 expert 内的 slot id， 第二个选择.....
         exp_rank = torch.sum(exp_mask * exp_rank, dim=-1)  # [k, B * T]
+        ##现在 exp_rank[i, j] = token j 的第i个选择在对应expert内的slot编号。
 
-        # mask probabilities to only include selected experts
         router_probs = router_probs.view(num_tokens, self.n_exp)[None, :] # [1, B * T, n_exp]
-        exp_weights = exp_mask * router_probs # [k, B * T, n_exp]
+        exp_weights = exp_mask * router_probs # [k, B * T, n_exp]  拿到对应的权重
 
-        # convert rank into one-hot vectors over the available capacity
-        # stores the position of each token within the capacity of the selected expert
+
+        ## 以capacity构造最终的rank
         exp_rank_sc = F.one_hot(exp_rank, num_classes=exp_capacity) # [k, B * T, exp_capacity]
 
-        # create a vector that stores, for each token, the weight of selected
-        # experts at token's position in the capacity of that expert
-        # size of tensor is [B * T, n_exp, exp_capacity]
-        cb_weight = torch.sum(exp_weights.unsqueeze(3) * exp_rank_sc.unsqueeze(2), dim=0)
+      
+        cb_weight = torch.sum(exp_weights.unsqueeze(3) * exp_rank_sc.unsqueeze(2), dim=0)  ## 对k求和 拿到最终结果
         # sec_mask = cb_weight.bool() # binary mask of selected experts for each token
         sec_mask = cb_weight.to(torch.bool)
         return used_capacity, cb_weight, sec_mask
     
-    def compute_aux_loss(self, expert_probs: torch.Tensor, indices: torch.Tensor):
+    def compute_aux_loss(self, expert_probs: torch.Tensor, indices: torch.Tensor):  ## 主要是算aux_loss; 专家数*（平均每个专家的权重*平均每个专家被分配到的token比例) 越小越稳定   
         """
         Computes Switch Transformer auxiliary loss (https://arxiv.org/abs/2101.03961)
         See equations (4)-(6) on page 7
@@ -200,16 +190,17 @@ class Router(nn.Module):
         # total number of tokens is defined as total tokens in batch * k
         # (k = 1) for the Switch Transformer
         with torch.no_grad():
-            one_hot_indices = F.one_hot(indices, num_classes=self.n_exp)  # [B, T, k, n_exp]
-            one_hot_indices = torch.sum(one_hot_indices.float(), dim=2)  # [B, T, n_exp] (sum over k dimension)
-            tokens_per_expert = torch.mean(one_hot_indices.float(), dim=(0, 1))
+            one_hot_indices = F.one_hot(indices, num_classes=self.n_exp)  #  将每个 token 的专家索引转换为 one-hot 向量  [B, T, k, n_exp] 
+            one_hot_indices = torch.sum(one_hot_indices.float(), dim=2)  # [B, T, n_exp] (sum over k dimension) 将 k 个 top-k token 分配累加
+            tokens_per_expert = torch.mean(one_hot_indices.float(), dim=(0, 1)) ## 该专家被分配到的token比例  （token 分配给专家 j 的数量和​/B*T）！！！ 返回的shape就是 [n_exp,]  就是aux_loss 中的 frac
 
         # equation (6): compute ratio of router probability allocated to each expert
-        prob_per_expert = torch.mean(expert_probs.float(), dim=(0, 1))
+        ## expert_probs的shape是  （B,T,n_exp)为权重   这里表示（分配给专家 j 的权重和​/B*T）即平均每个专家的权重是多少 ！！！  返回的shape就是 [n_exp,] 这就是aux_loss 中的 importance
+        prob_per_expert = torch.mean(expert_probs.float(), dim=(0, 1)) 
 
         # equation (4): take a scaled dot product between prob/token allocation vectors
         # multiply the result by the number of experts
-        return self.n_exp * torch.sum(prob_per_expert * tokens_per_expert)
+        return self.n_exp * torch.sum(prob_per_expert * tokens_per_expert)  ##最后乘一起然后*专家数 就为aux loss！！！  越小越稳定
     
     def compute_router_z_loss(self, logits: torch.Tensor):
         """
@@ -237,7 +228,7 @@ class Router(nn.Module):
         assert capacity > 0
         return int(capacity)
 
-class MLP(nn.Module):
+class MLP(nn.Module): ### 俩层MLP!!!
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
@@ -252,7 +243,7 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class MLPExperts(nn.Module):
+class MLPExperts(nn.Module):  ## 其实就是过俩层mlp+dropout！！！！
     """
     implementation of multiple MLP-based experts that can process input
     in batch -- based upon ColossalAI OpenMoE but simple, has optional bias, and
@@ -273,7 +264,7 @@ class MLPExperts(nn.Module):
     
 
     def forward(self, x):
-        x = torch.bmm(x, self.c_fc)
+        x = torch.bmm(x, self.c_fc)  ## bmm就是做矩阵乘法
         if self.bias:
             x += self.fc_bias
         x = self.gelu(x)
@@ -283,7 +274,7 @@ class MLPExperts(nn.Module):
         x = self.dropout(x)
         return x
 
-class MOELayer(nn.Module):
+class MOELayer(nn.Module):  ## 就是router产生topk的权重 然后乘对应选择的expert的输出 做加权和！！！！ 最终输出 = top-k 专家输出的加权和
     def __init__(self, config):
         super().__init__()
         self.router = Router(config) # (noisy) top k router
@@ -346,11 +337,11 @@ class MOELayer(nn.Module):
         # resize output before return
         return output.view(B, T, n_embd)
 
-class Block(nn.Module):
+class Block(nn.Module):  ## 一个block为  x经过layernorm + 做casual attention +layernorm + mlp/moe ！！！！
 
     def __init__(self, config, use_moe=False):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)  
         self.attn = CausalSelfAttention(config)
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         if use_moe:

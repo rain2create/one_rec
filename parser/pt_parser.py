@@ -376,12 +376,12 @@ class PtParser:
     def extract_features(self, features: Dict[str, np.ndarray]) -> Dict[str, Union[torch.Tensor, np.ndarray]]:
         res = {}
         # user static and context 
-        # uid, sign, 过去几个自动播, 是否自动播, 刷屏深度, 当前时间
+        # uid, sign, 过去几个自动播, 是否自动播, 刷屏深度, 当前时间  主要为用户静态特征
         res.update(self.preprocess_user_features(features))
 
         # user short time behavior: logsess
         # 视频id, 作者id, tag id, 时间戳，视频时长, 观看时长，用户label
-        res.update(self.preprocess_logsess_features(features, res["logtime"]))
+        res.update(self.preprocess_user_features(features, res["logtime"]))
 
         # user long time behavior: logqueue
         # 视频id, 作者id, tag id, 时间戳，视频时长, 观看时长，用户label

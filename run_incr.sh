@@ -3,8 +3,8 @@ mkdir -p ../log
 
 torch_path=/mnt_onerec_model/tools/cuda12/bin/torchrun
 python_path=/mnt_onerec_model/tools/cuda12/bin/python
-done_spec=seq_enc.finish.expl
-use_corpus_days=30
+done_spec=base.finish.expl.64.dur.rl
+use_corpus_days=3
 cuda_idx=0
 
 max_ckpt=$(ls ../data/pt_model/checkpoint-*.pt | sed 's/.*checkpoint-\([0-9]\+\)\.pt/\1/' | sort -n | tail -1)

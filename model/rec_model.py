@@ -16,6 +16,13 @@ from model.encoder import Encoder
 from model.decoder import Decoder
 from arguments.model_args import ModelArguments
 
+### 这一块单就是把sprase_model,encoder，decoder全过了一遍！！！
+
+
+
+
+
+
 # # 允许 cuBLAS 在 FP32 矩阵乘法中使用 TF32
 # Torch.backends.cuda.matmul.allow_tf32 = True
 # # 允许 cuDNN 在 FP32 卷积中使用 TF32

@@ -303,7 +303,7 @@ advantages = w + duration_adv
                                     │
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ Encoder                                                                 │
+│ Encoder（context_processor ）                                           │
 │ - 特征投影MLP (4类特征各自投影)                                          │
 │ - 拼接 + 位置编码 + LayerNorm                                            │
 │ 输出: context_emb [B, 91, model_dim], attn_mask [B, 91]                │

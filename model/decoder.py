@@ -424,7 +424,7 @@ class Decoder(nn.Module):
         masked_labels[~mask_expanded] = self.ignore_idx # 设置无效位置忽略，只看有效的label
 
         if (masked_labels != self.ignore_idx).any():
-            loss = self.loss_fn(output_logits, masked_labels)  ## 交叉熵求loss，这里为本身原始预测loss  -log(p)
+            loss = self.loss_fn(output_logits, masked_labels)  ## 交叉熵求loss， 这里就是NTP loss -log(p)
         
         ## 下面为强化学习loss
 

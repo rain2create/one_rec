@@ -353,7 +353,7 @@ class Decoder(nn.Module):
         ent = -(probs * logp).sum(dim=-1)  # [B]
         return ent.mean()  # scalar
 
-    def rl_loss(self, features: Dict[str, torch.Tensor], pi_new: torch.Tensor):  ## 这是什么算法
+    def rl_loss(self, features: Dict[str, torch.Tensor], pi_new: torch.Tensor):  ## GBPO
         # pi_safe = torch.where(
         #     features['advantages'] >= 0.0, 
         #     torch.maximum(features['pi_old'], pi_new),
